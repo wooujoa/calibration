@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'eye_in_hand_l_calibration = calibration.eye_in_hand_l_calibration:main',
             'eye_in_hand_r_calibration = calibration.eye_in_hand_r_calibration:main',
+            'eye_in_hand_calib_any = calibration.eye_in_hand_calib_any:main',
             'eye_in_hand_calib_pub = calibration.eye_in_hand_calib_pub:main',
             'eye_in_hand_calib_pub_point = calibration.eye_in_hand_calib_pub_point:main',
             'eye_in_hand_calib_pub_r = calibration.eye_in_hand_calib_pub_r:main',
