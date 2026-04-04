@@ -1,0 +1,185 @@
+{
+    "method": "tsai",
+    "data_dir": "/home/jwg/colcon_ws/src/calibration/calib_data_zed",
+    "pattern_size_inner_corners": {
+        "cols": 9,
+        "rows": 6
+    },
+    "square_size_m": 0.025,
+    "camera_matrix": [
+        [
+            363.999,
+            0.0,
+            324.376
+        ],
+        [
+            0.0,
+            363.999,
+            189.063
+        ],
+        [
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "dist_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+    ],
+    "num_used_samples": 19,
+    "num_rejected_samples": 0,
+    "used_samples": [
+        {
+            "json": "pose_00.json",
+            "image": "img_00.png",
+            "reproj_err": 0.2517046332359314
+        },
+        {
+            "json": "pose_01.json",
+            "image": "img_01.png",
+            "reproj_err": 0.2502215504646301
+        },
+        {
+            "json": "pose_02.json",
+            "image": "img_02.png",
+            "reproj_err": 0.24578548967838287
+        },
+        {
+            "json": "pose_03.json",
+            "image": "img_03.png",
+            "reproj_err": 0.2482699155807495
+        },
+        {
+            "json": "pose_04.json",
+            "image": "img_04.png",
+            "reproj_err": 0.2485874742269516
+        },
+        {
+            "json": "pose_05.json",
+            "image": "img_05.png",
+            "reproj_err": 0.25882357358932495
+        },
+        {
+            "json": "pose_06.json",
+            "image": "img_06.png",
+            "reproj_err": 0.25705191493034363
+        },
+        {
+            "json": "pose_07.json",
+            "image": "img_07.png",
+            "reproj_err": 0.26349446177482605
+        },
+        {
+            "json": "pose_08.json",
+            "image": "img_08.png",
+            "reproj_err": 0.29540443420410156
+        },
+        {
+            "json": "pose_09.json",
+            "image": "img_09.png",
+            "reproj_err": 0.23274047672748566
+        },
+        {
+            "json": "pose_10.json",
+            "image": "img_10.png",
+            "reproj_err": 0.225254625082016
+        },
+        {
+            "json": "pose_11.json",
+            "image": "img_11.png",
+            "reproj_err": 0.19417449831962585
+        },
+        {
+            "json": "pose_12.json",
+            "image": "img_12.png",
+            "reproj_err": 0.18458859622478485
+        },
+        {
+            "json": "pose_13.json",
+            "image": "img_13.png",
+            "reproj_err": 0.20683175325393677
+        },
+        {
+            "json": "pose_14.json",
+            "image": "img_14.png",
+            "reproj_err": 0.22174932062625885
+        },
+        {
+            "json": "pose_15.json",
+            "image": "img_15.png",
+            "reproj_err": 0.2526213228702545
+        },
+        {
+            "json": "pose_16.json",
+            "image": "img_16.png",
+            "reproj_err": 0.2783712148666382
+        },
+        {
+            "json": "pose_17.json",
+            "image": "img_17.png",
+            "reproj_err": 0.2634108364582062
+        },
+        {
+            "json": "pose_18.json",
+            "image": "img_18.png",
+            "reproj_err": 0.19888941943645477
+        }
+    ],
+    "rejected_samples": [],
+    "T_cam_to_head": [
+        [
+            0.6719711470711535,
+            0.693931847164928,
+            0.25867618559532896,
+            0.05790415260332063
+        ],
+        [
+            -0.7342850612636574,
+            0.6697325527275063,
+            0.11083211006799683,
+            -0.10256522269821394
+        ],
+        [
+            -0.09633393124390222,
+            -0.26441803892202353,
+            0.9595847405954966,
+            0.04298550218103652
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+        ]
+    ],
+    "T_head_to_cam": [
+        [
+            0.6719711470711535,
+            -0.7342850612636574,
+            -0.09633393124390222,
+            -0.11008106826592261
+        ],
+        [
+            0.693931847164928,
+            0.6697325527275063,
+            -0.26441803892202353,
+            0.03987587503298589
+        ],
+        [
+            0.25867618559532896,
+            0.11083211006799683,
+            0.9595847405954966,
+            -0.04485913723407685
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+        ]
+    ]
+}

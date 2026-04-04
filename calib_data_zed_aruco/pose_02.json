@@ -1,0 +1,58 @@
+{
+    "index": 2,
+    "status": "SUCCESS",
+    "image_file": "img_02.png",
+    "debug_image_file": "img_02_debug.png",
+    "image_stamp": {
+        "sec": 1775341387,
+        "nanosec": 210410609
+    },
+    "image_frame_id": "zedm_left_camera_optical_frame",
+    "base_frame": "base_link",
+    "head_frame": "head_link2",
+    "camera_frame": "zedm_left_camera_optical_frame",
+    "aruco": {
+        "enabled": true,
+        "found": true,
+        "dict": "DICT_4X4_50",
+        "target_id": 1
+    },
+    "tf_base_to_head": {
+        "parent_frame": "base_link",
+        "child_frame": "head_link2",
+        "translation": [
+            0.07948759961748487,
+            0.0,
+            1.5787358989135705
+        ],
+        "rotation_quat": [
+            -1.0300055540822661e-14,
+            0.0995436186599664,
+            -1.0295885720394264e-13,
+            0.9950331994381288
+        ],
+        "tf_stamp": {
+            "sec": 1775341387,
+            "nanosec": 210410609
+        }
+    },
+    "tf_base_to_camera": {
+        "parent_frame": "base_link",
+        "child_frame": "zedm_left_camera_optical_frame",
+        "translation": [
+            0.1006568529531708,
+            0.024982029999995072,
+            1.5632765318369468
+        ],
+        "rotation_quat": [
+            0.5472884090490013,
+            -0.5472884090469016,
+            0.4477447903891379,
+            -0.4477447903917044
+        ],
+        "tf_stamp": {
+            "sec": 1775341387,
+            "nanosec": 210410609
+        }
+    }
+}

@@ -10,14 +10,14 @@ from rclpy.node import Node
 from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
 
 
-class AnyGraspBaseTransformerLeft(Node):
+class AnyGraspBaseTransformerRight(Node):
     """
-    Base-frame visualization/debug node for LEFT arm.
+    Base-frame visualization/debug node.
 
     Purpose:
       1) Transform AnyGrasp best grasp pose from camera optical frame to base_link
@@ -33,16 +33,16 @@ class AnyGraspBaseTransformerLeft(Node):
 
     Recommended RViz setup:
       - Fixed Frame: base_link
-      - PointCloud2: /yolo/target_pc_base_l
-      - Pose: /anygrasp/best_pose_base_l
-      - MarkerArray: /anygrasp/debug_axes_base_l
+      - PointCloud2: /yolo/target_pc_base
+      - Pose: /anygrasp/best_pose_base_r
+      - MarkerArray: /anygrasp/debug_axes_base
     """
 
     def __init__(self):
-        super().__init__('anygrasp_base_transformer_left')
+        super().__init__('anygrasp_base_transformer_right')
 
         # ------------------------------------------------------------
-        # Hand-eye: camera optical -> arm_l_link7
+        # Hand-eye: camera optical -> arm_r_link7 (calibration result)
         # ------------------------------------------------------------
         self.T_cam_to_link7 = np.array([
             [ 0.9954,  0.0000, -0.0958,  0.0982],
@@ -52,7 +52,8 @@ class AnyGraspBaseTransformerLeft(Node):
         ], dtype=np.float64)
 
         # ------------------------------------------------------------
-        # Fixed URDF transform: arm_l_link7 -> gripper_l_rh_p12_rn_base
+        # Fixed URDF transform: arm_r_link7 -> gripper_r_rh_p12_rn_base
+        # URDF: <origin rpy="0 3.14159265359 3.14159265359" xyz="0 0 -0.078"/>
         # ------------------------------------------------------------
         self.T_link7_to_gripper_base = np.eye(4, dtype=np.float64)
         self.T_link7_to_gripper_base[:3, :3] = np.array([
@@ -67,6 +68,14 @@ class AnyGraspBaseTransformerLeft(Node):
 
         # ------------------------------------------------------------
         # Pose-only alignment: AnyGrasp gripper frame -> ffw gripper base frame
+        # 1) always apply local +90 deg CCW about Y
+        # 2) optionally apply additional local 180 deg about Z
+        #    ONLY when the aligned gripper +x axis points downward in base frame.
+        #
+        # This must affect ONLY grasp pose orientation,
+        # not contact/object-center points nor point clouds.
+        # Right-multiplication means local-axis rotations in the gripper frame.
+        # Translation is intentionally zero so the grasp center is preserved.
         # ------------------------------------------------------------
         self.T_pose_align_y90 = np.eye(4, dtype=np.float64)
         self.T_pose_align_y90[:3, :3] = R.from_euler('y', 90.0, degrees=True).as_matrix()
@@ -81,7 +90,6 @@ class AnyGraspBaseTransformerLeft(Node):
         self.declare_parameter('apply_anygrasp_pose_frame_alignment', True)
         self.declare_parameter('auto_flip_pose_z_180_if_x_points_down', True)
         self.declare_parameter('x_axis_downward_flip_threshold', 0.0)
-
         self.T_grasp_to_tool = np.eye(4, dtype=np.float64)
         self.T_grasp_to_tool[:3, :3] = np.array([
             [ 1.0,  0.0,  0.0],
@@ -93,23 +101,23 @@ class AnyGraspBaseTransformerLeft(Node):
         # Topics / frames
         # ------------------------------------------------------------
         self.declare_parameter('grasp_pose_input_topic', '/anygrasp/best_pose_raw')
-        self.declare_parameter('grasp_pose_output_topic', '/anygrasp/best_pose_base_l')
+        self.declare_parameter('grasp_pose_output_topic', '/anygrasp/best_pose_base_r')
 
         self.declare_parameter('contact_point_input_topic', '/anygrasp/best_contact_point')
-        self.declare_parameter('contact_point_output_topic', '/anygrasp/best_contact_point_base_l')
+        self.declare_parameter('contact_point_output_topic', '/anygrasp/best_contact_point_base_r')
 
         self.declare_parameter('object_center_input_topic', '/sam3/object_center_camera')
-        self.declare_parameter('object_center_output_topic', '/sam3/object_center_base_l')
+        self.declare_parameter('object_center_output_topic', '/sam3/object_center_base')
 
         self.declare_parameter('target_pc_input_topic', '/yolo/target_pc')
-        self.declare_parameter('target_pc_output_topic', '/yolo/target_pc_base_l')
+        self.declare_parameter('target_pc_output_topic', '/yolo/target_pc_base')
 
-        self.declare_parameter('debug_axes_base_topic', '/anygrasp/debug_axes_base_l')
+        self.declare_parameter('debug_axes_base_topic', '/anygrasp/debug_axes_base')
 
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('base_frame_candidates', ['base_link', 'lift_link', 'arm_base_link'])
-        self.declare_parameter('gripper_frame', 'gripper_l_rh_p12_rn_base')
-        self.declare_parameter('camera_frame', 'camera_l_color_optical_frame')
+        self.declare_parameter('gripper_frame', 'gripper_r_rh_p12_rn_base')
+        self.declare_parameter('camera_frame', 'camera_r_color_optical_frame')
 
         self.declare_parameter('use_direct_camera_tf', False)
         self.declare_parameter('use_msg_timestamp', False)
@@ -225,7 +233,7 @@ class AnyGraspBaseTransformerLeft(Node):
             self.pub_debug_axes_base = self.create_publisher(MarkerArray, self.debug_axes_base_topic, 10)
 
         self.get_logger().info('========================================')
-        self.get_logger().info('AnyGrasp Base Transformer Initialized (LEFT, BASE FRAME)')
+        self.get_logger().info('AnyGrasp Base Transformer Initialized (BASE FRAME + POINT CLOUD)')
         self.get_logger().info(f'grasp_pose_input_topic        : {self.grasp_pose_input_topic}')
         self.get_logger().info(f'contact_point_input_topic     : {self.contact_point_input_topic}')
         self.get_logger().info(f'object_center_input_topic     : {self.object_center_input_topic}')
@@ -339,6 +347,8 @@ class AnyGraspBaseTransformerLeft(Node):
             return None
 
         T_final_base = T_raw_base.copy()
+        flip_applied = False
+        x_axis_after_y90 = None
 
         if self.apply_anygrasp_pose_frame_alignment:
             T_final_base = T_final_base @ self.T_pose_align_y90
@@ -349,6 +359,7 @@ class AnyGraspBaseTransformerLeft(Node):
                 if x_axis_after_y90[2] < self.x_axis_downward_flip_threshold:
                     T_final_base = T_final_base @ self.T_pose_align_z180
                     path_label += '->auto_flip(Rz+180_local_if_x_down)'
+                    flip_applied = True
                 else:
                     path_label += '->auto_flip(skip_x_not_down)'
 
@@ -385,7 +396,9 @@ class AnyGraspBaseTransformerLeft(Node):
     def transform_pointcloud(self, msg: PointCloud2, source_name='POINTCLOUD'):
         frame_id = msg.header.frame_id.strip()
         if frame_id == self.base_frame:
-            return msg
+            out = PointCloud2()
+            out = msg
+            return out
 
         try:
             if self.use_direct_camera_tf and frame_id not in ('', self.gripper_frame):
@@ -403,6 +416,7 @@ class AnyGraspBaseTransformerLeft(Node):
             if frame_id == self.gripper_frame:
                 return self.apply_transform_to_cloud(msg, T_gripper_to_base, self.base_frame)
 
+            # camera-like cloud -> gripper base
             T_cam_to_base = T_gripper_to_base @ self.T_cam_to_gripper
             return self.apply_transform_to_cloud(msg, T_cam_to_base, self.base_frame)
 
@@ -411,6 +425,10 @@ class AnyGraspBaseTransformerLeft(Node):
             return None
 
     def apply_transform_to_cloud(self, cloud_msg: PointCloud2, T: np.ndarray, out_frame: str) -> PointCloud2:
+        """
+        Generic but debug-oriented PointCloud2 transform.
+        Preserves all fields and only changes x,y,z.
+        """
         field_names = [f.name for f in cloud_msg.fields]
         if 'x' not in field_names or 'y' not in field_names or 'z' not in field_names:
             raise RuntimeError('PointCloud2 does not contain x/y/z fields')
@@ -617,67 +635,6 @@ class AnyGraspBaseTransformerLeft(Node):
 
         self.pub_debug_axes_base.publish(ma)
 
-    def make_delete_all_marker(self, header_frame, stamp):
-        m = Marker()
-        m.header.frame_id = header_frame
-        m.header.stamp = stamp
-        m.action = Marker.DELETEALL
-        return m
-
-    def make_axes_triplet(self, header_frame, stamp, origin, rotation, ns_prefix, ids, colors):
-        markers = []
-        axes = [
-            rotation[:, 0].astype(np.float64),
-            rotation[:, 1].astype(np.float64),
-            rotation[:, 2].astype(np.float64),
-        ]
-
-        for i, axis_vec in enumerate(axes):
-            axis_vec = axis_vec / max(np.linalg.norm(axis_vec), 1e-12)
-            end = origin + self.axes_length * axis_vec
-
-            m = Marker()
-            m.header.frame_id = header_frame
-            m.header.stamp = stamp
-            m.ns = ns_prefix
-            m.id = int(ids[i])
-            m.type = Marker.ARROW
-            m.action = Marker.ADD
-            m.points = [
-                Point(x=float(origin[0]), y=float(origin[1]), z=float(origin[2])),
-                Point(x=float(end[0]), y=float(end[1]), z=float(end[2])),
-            ]
-            m.scale.x = self.axes_shaft_diameter
-            m.scale.y = self.axes_head_diameter
-            m.scale.z = self.axes_head_length
-            c = colors[i]
-            m.color = ColorRGBA(r=float(c[0]), g=float(c[1]), b=float(c[2]), a=0.95)
-            if self.axes_lifetime_sec > 0.0:
-                m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
-            markers.append(m)
-
-        return markers
-
-    def make_sphere_marker(self, header_frame, stamp, marker_id, ns, xyz, radius, rgba):
-        m = Marker()
-        m.header.frame_id = header_frame
-        m.header.stamp = stamp
-        m.ns = ns
-        m.id = int(marker_id)
-        m.type = Marker.SPHERE
-        m.action = Marker.ADD
-        m.pose.position.x = float(xyz[0])
-        m.pose.position.y = float(xyz[1])
-        m.pose.position.z = float(xyz[2])
-        m.pose.orientation.w = 1.0
-        m.scale.x = float(radius)
-        m.scale.y = float(radius)
-        m.scale.z = float(radius)
-        m.color = ColorRGBA(r=float(rgba[0]), g=float(rgba[1]), b=float(rgba[2]), a=float(rgba[3]))
-        if self.axes_lifetime_sec > 0.0:
-            m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
-        return m
-
     # ============================================================
     # TF helpers
     # ============================================================
@@ -764,7 +721,7 @@ class AnyGraspBaseTransformerLeft(Node):
 
         return None, None
 
-    def lookup_transform_matrix(self, target_frame, source_frame, stamp, source_name='TF'):
+    def lookup_transform_matrix(self, target_frame: str, source_frame: str, stamp, source_name='TF_MATRIX') -> np.ndarray:
         t = self.lookup_transform_with_fallback(target_frame, source_frame, stamp, source_name)
         if t is None:
             raise RuntimeError(f'TF unavailable: {target_frame} <- {source_frame}')
@@ -804,6 +761,100 @@ class AnyGraspBaseTransformerLeft(Node):
         )
 
     # ============================================================
+    # Marker helpers
+    # ============================================================
+    def make_delete_all_marker(self, header_frame: str, stamp) -> Marker:
+        m = Marker()
+        m.header.frame_id = header_frame
+        m.header.stamp = stamp
+        m.action = Marker.DELETEALL
+        return m
+
+    def make_axes_triplet(self, header_frame, stamp, origin, rotation, ns_prefix, ids, colors):
+        x_axis = rotation[:, 0]
+        y_axis = rotation[:, 1]
+        z_axis = rotation[:, 2]
+
+        return [
+            self.make_axis_arrow(header_frame, stamp, ids[0], f'{ns_prefix}_x', origin, x_axis, colors[0]),
+            self.make_axis_arrow(header_frame, stamp, ids[1], f'{ns_prefix}_y', origin, y_axis, colors[1]),
+            self.make_axis_arrow(header_frame, stamp, ids[2], f'{ns_prefix}_z', origin, z_axis, colors[2]),
+        ]
+
+    def make_axis_arrow(self, header_frame, stamp, marker_id, ns, origin, axis_dir, rgb):
+        m = Marker()
+        m.header.frame_id = header_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = marker_id
+        m.type = Marker.ARROW
+        m.action = Marker.ADD
+
+        axis_dir = np.asarray(axis_dir, dtype=np.float64)
+        n = np.linalg.norm(axis_dir)
+        if n < 1e-12:
+            axis_dir = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            axis_dir = axis_dir / n
+
+        p0 = Point()
+        p0.x = float(origin[0])
+        p0.y = float(origin[1])
+        p0.z = float(origin[2])
+
+        p1 = Point()
+        p1.x = float(origin[0] + self.axes_length * axis_dir[0])
+        p1.y = float(origin[1] + self.axes_length * axis_dir[1])
+        p1.z = float(origin[2] + self.axes_length * axis_dir[2])
+
+        m.points = [p0, p1]
+        m.scale.x = float(self.axes_shaft_diameter)
+        m.scale.y = float(self.axes_head_diameter)
+        m.scale.z = float(self.axes_head_length)
+
+        m.color = ColorRGBA(
+            r=float(rgb[0]),
+            g=float(rgb[1]),
+            b=float(rgb[2]),
+            a=1.0
+        )
+
+        if self.axes_lifetime_sec > 0.0:
+            m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
+
+        return m
+
+    def make_sphere_marker(self, header_frame, stamp, marker_id, ns, xyz, radius, rgba):
+        m = Marker()
+        m.header.frame_id = header_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = marker_id
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+
+        m.pose.position.x = float(xyz[0])
+        m.pose.position.y = float(xyz[1])
+        m.pose.position.z = float(xyz[2])
+        m.pose.orientation.w = 1.0
+
+        m.scale.x = float(radius)
+        m.scale.y = float(radius)
+        m.scale.z = float(radius)
+
+        m.color = ColorRGBA(
+            r=float(rgba[0]),
+            g=float(rgba[1]),
+            b=float(rgba[2]),
+            a=float(rgba[3]),
+        )
+
+        if self.axes_lifetime_sec > 0.0:
+            m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
+
+        return m
+
+    # ============================================================
     # Math / pose helpers
     # ============================================================
     @staticmethod
@@ -840,7 +891,7 @@ class AnyGraspBaseTransformerLeft(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AnyGraspBaseTransformerLeft()
+    node = AnyGraspBaseTransformerRight()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
