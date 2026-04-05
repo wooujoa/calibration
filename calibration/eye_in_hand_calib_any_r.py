@@ -9,8 +9,8 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped
 from std_msgs.msg import ColorRGBA
-from visualization_msgs.msg import Marker, MarkerArray
-from sensor_msgs.msg import PointCloud2, PointField
+from visualization_msgs.msg import Marker
+from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
 
@@ -24,18 +24,14 @@ class AnyGraspBaseTransformerRight(Node):
       2) Transform AnyGrasp contact point to base_link
       3) Transform SAM3 object center to base_link
       4) Transform YOLO target point cloud to base_link
-      5) Publish base-frame MarkerArray that shows:
-         - base axes
-         - predicted grasp axes
-         - current gripper axes
-         - contact point
-         - object center
+      5) Publish RViz markers in base_link for:
+         - grasp contact point
+         - grasp pose as a parallel-jaw gripper shape
 
-    Recommended RViz setup:
+    RViz:
       - Fixed Frame: base_link
-      - PointCloud2: /yolo/target_pc_base
-      - Pose: /anygrasp/best_pose_base_r
-      - MarkerArray: /anygrasp/debug_axes_base
+      - Marker: /anygrasp/best_contact_marker
+      - Marker: /anygrasp/best_pose_marker
     """
 
     def __init__(self):
@@ -112,8 +108,6 @@ class AnyGraspBaseTransformerRight(Node):
         self.declare_parameter('target_pc_input_topic', '/yolo/target_pc')
         self.declare_parameter('target_pc_output_topic', '/yolo/target_pc_base')
 
-        self.declare_parameter('debug_axes_base_topic', '/anygrasp/debug_axes_base')
-
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('base_frame_candidates', ['base_link', 'lift_link', 'arm_base_link'])
         self.declare_parameter('gripper_frame', 'gripper_r_rh_p12_rn_base')
@@ -129,20 +123,24 @@ class AnyGraspBaseTransformerRight(Node):
         self.declare_parameter('log_pose', True)
         self.declare_parameter('log_pointcloud', False)
 
-        # debug marker style
-        self.declare_parameter('publish_debug_axes_base', True)
-        self.declare_parameter('show_current_gripper_axes', True)
-        self.declare_parameter('show_contact_marker', True)
-        self.declare_parameter('show_object_center_marker', True)
+        # RViz marker topics
+        self.declare_parameter('best_pose_marker_topic', '/anygrasp/best_pose_marker')
+        self.declare_parameter('best_contact_marker_topic', '/anygrasp/best_contact_marker')
 
-        self.declare_parameter('axes_length', 0.08)
-        self.declare_parameter('axes_shaft_diameter', 0.004)
-        self.declare_parameter('axes_head_diameter', 0.008)
-        self.declare_parameter('axes_head_length', 0.012)
+        # marker style
+        self.declare_parameter('contact_marker_radius', 0.018)
         self.declare_parameter('axes_lifetime_sec', 0.0)
 
-        self.declare_parameter('contact_marker_radius', 0.018)
-        self.declare_parameter('object_center_marker_radius', 0.02)
+        self.declare_parameter('publish_best_pose_marker', True)
+        self.declare_parameter('publish_best_contact_marker', True)
+
+        self.declare_parameter('gripper_marker_line_width', 0.006)
+        self.declare_parameter('gripper_opening', 0.10)          # jaw opening along local y
+        self.declare_parameter('gripper_finger_length', 0.060)   # along local x
+        self.declare_parameter('gripper_finger_depth', 0.020)    # along local z
+        self.declare_parameter('gripper_palm_depth', 0.030)      # backward along -z
+        self.declare_parameter('gripper_wrist_length', 0.020)    # further backward along -z
+        self.declare_parameter('gripper_marker_rgba', [1.0, 1.0, 1.0, 1.0])
 
         # ------------------------------------------------------------
         # Parameter fetch
@@ -159,8 +157,6 @@ class AnyGraspBaseTransformerRight(Node):
         self.target_pc_input_topic = self.get_parameter('target_pc_input_topic').value
         self.target_pc_output_topic = self.get_parameter('target_pc_output_topic').value
 
-        self.debug_axes_base_topic = self.get_parameter('debug_axes_base_topic').value
-
         self.base_frame = self.get_parameter('base_frame').value
         self.base_frame_candidates = list(self.get_parameter('base_frame_candidates').value)
         self.gripper_frame = self.get_parameter('gripper_frame').value
@@ -175,27 +171,30 @@ class AnyGraspBaseTransformerRight(Node):
         self.log_pose = bool(self.get_parameter('log_pose').value)
         self.log_pointcloud = bool(self.get_parameter('log_pointcloud').value)
 
-        self.publish_debug_axes_base = bool(self.get_parameter('publish_debug_axes_base').value)
-        self.show_current_gripper_axes = bool(self.get_parameter('show_current_gripper_axes').value)
-        self.show_contact_marker = bool(self.get_parameter('show_contact_marker').value)
-        self.show_object_center_marker = bool(self.get_parameter('show_object_center_marker').value)
-
-        self.axes_length = float(self.get_parameter('axes_length').value)
-        self.axes_shaft_diameter = float(self.get_parameter('axes_shaft_diameter').value)
-        self.axes_head_diameter = float(self.get_parameter('axes_head_diameter').value)
-        self.axes_head_length = float(self.get_parameter('axes_head_length').value)
-        self.axes_lifetime_sec = float(self.get_parameter('axes_lifetime_sec').value)
+        self.best_pose_marker_topic = self.get_parameter('best_pose_marker_topic').value
+        self.best_contact_marker_topic = self.get_parameter('best_contact_marker_topic').value
 
         self.contact_marker_radius = float(self.get_parameter('contact_marker_radius').value)
-        self.object_center_marker_radius = float(self.get_parameter('object_center_marker_radius').value)
+        self.axes_lifetime_sec = float(self.get_parameter('axes_lifetime_sec').value)
 
         self.apply_grasp_tool_offset = bool(self.get_parameter('apply_grasp_tool_offset').value)
         self.apply_anygrasp_pose_frame_alignment = bool(self.get_parameter('apply_anygrasp_pose_frame_alignment').value)
         self.auto_flip_pose_z_180_if_x_points_down = bool(self.get_parameter('auto_flip_pose_z_180_if_x_points_down').value)
         self.x_axis_downward_flip_threshold = float(self.get_parameter('x_axis_downward_flip_threshold').value)
 
+        self.publish_best_pose_marker_enabled = bool(self.get_parameter('publish_best_pose_marker').value)
+        self.publish_best_contact_marker_enabled = bool(self.get_parameter('publish_best_contact_marker').value)
+
+        self.gripper_marker_line_width = float(self.get_parameter('gripper_marker_line_width').value)
+        self.gripper_opening = float(self.get_parameter('gripper_opening').value)
+        self.gripper_finger_length = float(self.get_parameter('gripper_finger_length').value)
+        self.gripper_finger_depth = float(self.get_parameter('gripper_finger_depth').value)
+        self.gripper_palm_depth = float(self.get_parameter('gripper_palm_depth').value)
+        self.gripper_wrist_length = float(self.get_parameter('gripper_wrist_length').value)
+        self.gripper_marker_rgba = [float(v) for v in self.get_parameter('gripper_marker_rgba').value]
+
         # ------------------------------------------------------------
-        # Internal cache for marker redraw
+        # Internal cache
         # ------------------------------------------------------------
         self.last_pred_pose_base = None
         self.last_contact_point_base = None
@@ -228,12 +227,11 @@ class AnyGraspBaseTransformerRight(Node):
         self.pub_object_center_base = self.create_publisher(PointStamped, self.object_center_output_topic, 10)
         self.pub_target_pc_base = self.create_publisher(PointCloud2, self.target_pc_output_topic, 10)
 
-        self.pub_debug_axes_base = None
-        if self.publish_debug_axes_base:
-            self.pub_debug_axes_base = self.create_publisher(MarkerArray, self.debug_axes_base_topic, 10)
+        self.pub_best_pose_marker = self.create_publisher(Marker, self.best_pose_marker_topic, 10)
+        self.pub_best_contact_marker = self.create_publisher(Marker, self.best_contact_marker_topic, 10)
 
         self.get_logger().info('========================================')
-        self.get_logger().info('AnyGrasp Base Transformer Initialized (BASE FRAME + POINT CLOUD)')
+        self.get_logger().info('AnyGrasp Base Transformer Initialized')
         self.get_logger().info(f'grasp_pose_input_topic        : {self.grasp_pose_input_topic}')
         self.get_logger().info(f'contact_point_input_topic     : {self.contact_point_input_topic}')
         self.get_logger().info(f'object_center_input_topic     : {self.object_center_input_topic}')
@@ -242,7 +240,8 @@ class AnyGraspBaseTransformerRight(Node):
         self.get_logger().info(f'contact_point_output_topic    : {self.contact_point_output_topic}')
         self.get_logger().info(f'object_center_output_topic    : {self.object_center_output_topic}')
         self.get_logger().info(f'target_pc_output_topic        : {self.target_pc_output_topic}')
-        self.get_logger().info(f'debug_axes_base_topic         : {self.debug_axes_base_topic}')
+        self.get_logger().info(f'best_pose_marker_topic        : {self.best_pose_marker_topic}')
+        self.get_logger().info(f'best_contact_marker_topic     : {self.best_contact_marker_topic}')
         self.get_logger().info(f'camera_frame                  : {self.camera_frame}')
         self.get_logger().info(f'base_frame                    : {self.base_frame}')
         self.get_logger().info(f'gripper_frame                 : {self.gripper_frame}')
@@ -251,7 +250,7 @@ class AnyGraspBaseTransformerRight(Node):
         self.get_logger().info(f'T_cam_to_gripper_base        :\n{self.T_cam_to_gripper}')
         self.get_logger().info(f'T_pose_align_y90             :\n{self.T_pose_align_y90}')
         self.get_logger().info(f'T_pose_align_z180            :\n{self.T_pose_align_z180}')
-        self.get_logger().info('RViz: Fixed Frame = base_link')
+        self.get_logger().info('RViz Fixed Frame = base_link')
         self.get_logger().info('========================================')
 
     # ============================================================
@@ -268,7 +267,7 @@ class AnyGraspBaseTransformerRight(Node):
         if self.log_contact_point:
             self.log_point_compact('ANYGRASP_CONTACT_BASE', out, input_frame=msg.header.frame_id)
 
-        self.publish_debug_markers(out.header.stamp)
+        self.publish_best_contact_point_marker(out)
 
     def object_center_callback(self, msg: PointStamped):
         out = self.transform_point(msg, 'SAM3_OBJECT_CENTER')
@@ -278,8 +277,6 @@ class AnyGraspBaseTransformerRight(Node):
         self.pub_object_center_base.publish(out)
         self.last_object_center_base = out
         self.log_point_compact('SAM3_OBJECT_CENTER_BASE', out, input_frame=msg.header.frame_id)
-
-        self.publish_debug_markers(out.header.stamp)
 
     def grasp_pose_callback(self, msg: PoseStamped):
         result = self.transform_pose(msg, 'ANYGRASP_POSE')
@@ -294,7 +291,7 @@ class AnyGraspBaseTransformerRight(Node):
             self.log_pose_compact('ANYGRASP_POSE_BASE', pose_base_msg, input_frame=msg.header.frame_id)
             self.log_pose_axes_compact('ANYGRASP_POSE_BASE_AXES', T_final_base)
 
-        self.publish_debug_markers(msg.header.stamp)
+        self.publish_best_gripper_pose_marker(msg.header.stamp, T_final_base)
 
     def target_pc_callback(self, msg: PointCloud2):
         out = self.transform_pointcloud(msg, 'YOLO_TARGET_PC')
@@ -347,8 +344,6 @@ class AnyGraspBaseTransformerRight(Node):
             return None
 
         T_final_base = T_raw_base.copy()
-        flip_applied = False
-        x_axis_after_y90 = None
 
         if self.apply_anygrasp_pose_frame_alignment:
             T_final_base = T_final_base @ self.T_pose_align_y90
@@ -359,7 +354,6 @@ class AnyGraspBaseTransformerRight(Node):
                 if x_axis_after_y90[2] < self.x_axis_downward_flip_threshold:
                     T_final_base = T_final_base @ self.T_pose_align_z180
                     path_label += '->auto_flip(Rz+180_local_if_x_down)'
-                    flip_applied = True
                 else:
                     path_label += '->auto_flip(skip_x_not_down)'
 
@@ -539,101 +533,138 @@ class AnyGraspBaseTransformerRight(Node):
         return T_pose_base, T_intermediate, path_label
 
     # ============================================================
-    # Debug markers in base frame
+    # RViz markers: contact point + corrected gripper shape
     # ============================================================
-    def publish_debug_markers(self, stamp):
-        if self.pub_debug_axes_base is None:
+    def publish_best_contact_point_marker(self, msg: PointStamped):
+        if not self.publish_best_contact_marker_enabled:
             return
 
-        header_frame = self.base_frame
-        ma = MarkerArray()
-        ma.markers.append(self.make_delete_all_marker(header_frame, stamp))
+        p = msg.point
+        marker = self.make_sphere_marker(
+            header_frame=self.base_frame,
+            stamp=msg.header.stamp,
+            marker_id=0,
+            ns='best_contact_point',
+            xyz=np.array([p.x, p.y, p.z], dtype=np.float64),
+            radius=self.contact_marker_radius,
+            rgba=(1.0, 0.0, 1.0, 0.98),
+        )
+        self.pub_best_contact_marker.publish(marker)
 
-        # base axes
-        ma.markers.extend(
-            self.make_axes_triplet(
-                header_frame=header_frame,
-                stamp=stamp,
-                origin=np.array([0.0, 0.0, 0.0], dtype=np.float64),
-                rotation=np.eye(3, dtype=np.float64),
-                ns_prefix='base_axes',
-                ids=(0, 1, 2),
-                colors=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.4, 1.0)),
-            )
+    def publish_best_gripper_pose_marker(self, stamp, T_grasp_base: np.ndarray):
+        if not self.publish_best_pose_marker_enabled:
+            return
+
+        marker = self.make_parallel_jaw_gripper_marker(
+            header_frame=self.base_frame,
+            stamp=stamp,
+            marker_id=0,
+            ns='best_pose_gripper',
+            T=T_grasp_base,
+        )
+        self.pub_best_pose_marker.publish(marker)
+
+    def make_parallel_jaw_gripper_marker(self, header_frame, stamp, marker_id, ns, T: np.ndarray) -> Marker:
+        """
+        Corrected local-axis interpretation:
+          - local x : finger length direction
+          - local y : jaw opening direction
+          - local z : approach direction (toward object)
+
+        The marker origin is treated as the grasp center.
+        So the palm/wrist are drawn backward along -z.
+        """
+        m = Marker()
+        m.header.frame_id = header_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = marker_id
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        m.scale.x = float(self.gripper_marker_line_width)
+
+        rgba = self.gripper_marker_rgba
+        m.color = ColorRGBA(
+            r=float(rgba[0]),
+            g=float(rgba[1]),
+            b=float(rgba[2]),
+            a=float(rgba[3]),
         )
 
-        # predicted grasp axes
-        if self.last_pred_pose_base is not None:
-            T_pred = self.pose_to_matrix(
-                self.last_pred_pose_base.pose.position,
-                self.last_pred_pose_base.pose.orientation
-            )
-            ma.markers.extend(
-                self.make_axes_triplet(
-                    header_frame=header_frame,
-                    stamp=stamp,
-                    origin=T_pred[:3, 3],
-                    rotation=T_pred[:3, :3],
-                    ns_prefix='predicted_grasp_axes',
-                    ids=(10, 11, 12),
-                    colors=((1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.6, 1.0)),
-                )
-            )
+        if self.axes_lifetime_sec > 0.0:
+            m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
 
-        # current gripper axes
-        if self.show_current_gripper_axes:
-            try:
-                T_gripper_to_base = self.lookup_transform_matrix(
-                    target_frame=self.base_frame,
-                    source_frame=self.gripper_frame,
-                    stamp=stamp,
-                    source_name='DEBUG_CURRENT_GRIPPER_IN_BASE'
-                )
-                ma.markers.extend(
-                    self.make_axes_triplet(
-                        header_frame=header_frame,
-                        stamp=stamp,
-                        origin=T_gripper_to_base[:3, 3],
-                        rotation=T_gripper_to_base[:3, :3],
-                        ns_prefix='current_gripper_axes',
-                        ids=(20, 21, 22),
-                        colors=((1.0, 1.0, 0.0), (0.7, 1.0, 0.0), (0.0, 1.0, 1.0)),
-                    )
-                )
-            except Exception as e:
-                self.get_logger().warn(f'[DEBUG] failed current gripper marker publish: {repr(e)}')
+        opening = max(0.01, float(self.gripper_opening))
+        finger_len = max(0.001, float(self.gripper_finger_length))
+        finger_depth = max(0.001, float(self.gripper_finger_depth))
+        palm_depth = max(0.0, float(self.gripper_palm_depth))
+        wrist_len = max(0.0, float(self.gripper_wrist_length))
 
-        # contact point sphere
-        if self.show_contact_marker and self.last_contact_point_base is not None:
-            cp = self.last_contact_point_base.point
-            ma.markers.append(
-                self.make_sphere_marker(
-                    header_frame=header_frame,
-                    stamp=stamp,
-                    marker_id=30,
-                    ns='contact_point',
-                    xyz=np.array([cp.x, cp.y, cp.z], dtype=np.float64),
-                    radius=self.contact_marker_radius,
-                    rgba=(1.0, 0.0, 1.0, 0.95),
-                )
-            )
+        # Local geometry
+        # origin = grasp center
+        # x: finger length
+        # y: opening
+        # z: approach toward object
+        x0 = -0.5 * finger_len
+        x1 =  0.5 * finger_len
+        yL = -0.5 * opening
+        yR =  0.5 * opening
 
-        # object center sphere
-        if self.show_object_center_marker and self.last_object_center_base is not None:
-            oc = self.last_object_center_base.point
-            ma.markers.append(
-                self.make_sphere_marker(
-                    header_frame=header_frame,
-                    stamp=stamp,
-                    marker_id=31,
-                    ns='object_center',
-                    xyz=np.array([oc.x, oc.y, oc.z], dtype=np.float64),
-                    radius=self.object_center_marker_radius,
-                    rgba=(1.0, 0.5, 0.0, 0.95),
-                )
-            )
+        z_front = 0.0
+        z_finger_back = -finger_depth
+        z_palm = -(finger_depth + palm_depth)
+        z_wrist = z_palm - wrist_len
 
-        self.pub_debug_axes_base.publish(ma)
+        segs_local = [
+            # left finger rectangle in x-z plane at y = yL
+            ([x0, yL, z_front], [x1, yL, z_front]),
+            ([x0, yL, z_finger_back], [x1, yL, z_finger_back]),
+            ([x0, yL, z_front], [x0, yL, z_finger_back]),
+            ([x1, yL, z_front], [x1, yL, z_finger_back]),
+
+            # right finger rectangle in x-z plane at y = yR
+            ([x0, yR, z_front], [x1, yR, z_front]),
+            ([x0, yR, z_finger_back], [x1, yR, z_finger_back]),
+            ([x0, yR, z_front], [x0, yR, z_finger_back]),
+            ([x1, yR, z_front], [x1, yR, z_finger_back]),
+
+            # supports from finger backs to palm
+            ([0.0, yL, z_finger_back], [0.0, yL, z_palm]),
+            ([0.0, yR, z_finger_back], [0.0, yR, z_palm]),
+
+            # palm crossbar
+            ([0.0, yL, z_palm], [0.0, yR, z_palm]),
+
+            # wrist
+            ([0.0, 0.0, z_palm], [0.0, 0.0, z_wrist]),
+        ]
+
+        Rb = T[:3, :3]
+        tb = T[:3, 3]
+
+        pts = []
+        for a_local, b_local in segs_local:
+            a_local = np.asarray(a_local, dtype=np.float64)
+            b_local = np.asarray(b_local, dtype=np.float64)
+
+            a_base = Rb @ a_local + tb
+            b_base = Rb @ b_local + tb
+
+            pa = Point()
+            pa.x = float(a_base[0])
+            pa.y = float(a_base[1])
+            pa.z = float(a_base[2])
+
+            pb = Point()
+            pb.x = float(b_base[0])
+            pb.y = float(b_base[1])
+            pb.z = float(b_base[2])
+
+            pts.append(pa)
+            pts.append(pb)
+
+        m.points = pts
+        return m
 
     # ============================================================
     # TF helpers
@@ -721,12 +752,6 @@ class AnyGraspBaseTransformerRight(Node):
 
         return None, None
 
-    def lookup_transform_matrix(self, target_frame: str, source_frame: str, stamp, source_name='TF_MATRIX') -> np.ndarray:
-        t = self.lookup_transform_with_fallback(target_frame, source_frame, stamp, source_name)
-        if t is None:
-            raise RuntimeError(f'TF unavailable: {target_frame} <- {source_frame}')
-        return self.make_transform_matrix(t)
-
     # ============================================================
     # Logging
     # ============================================================
@@ -763,67 +788,6 @@ class AnyGraspBaseTransformerRight(Node):
     # ============================================================
     # Marker helpers
     # ============================================================
-    def make_delete_all_marker(self, header_frame: str, stamp) -> Marker:
-        m = Marker()
-        m.header.frame_id = header_frame
-        m.header.stamp = stamp
-        m.action = Marker.DELETEALL
-        return m
-
-    def make_axes_triplet(self, header_frame, stamp, origin, rotation, ns_prefix, ids, colors):
-        x_axis = rotation[:, 0]
-        y_axis = rotation[:, 1]
-        z_axis = rotation[:, 2]
-
-        return [
-            self.make_axis_arrow(header_frame, stamp, ids[0], f'{ns_prefix}_x', origin, x_axis, colors[0]),
-            self.make_axis_arrow(header_frame, stamp, ids[1], f'{ns_prefix}_y', origin, y_axis, colors[1]),
-            self.make_axis_arrow(header_frame, stamp, ids[2], f'{ns_prefix}_z', origin, z_axis, colors[2]),
-        ]
-
-    def make_axis_arrow(self, header_frame, stamp, marker_id, ns, origin, axis_dir, rgb):
-        m = Marker()
-        m.header.frame_id = header_frame
-        m.header.stamp = stamp
-        m.ns = ns
-        m.id = marker_id
-        m.type = Marker.ARROW
-        m.action = Marker.ADD
-
-        axis_dir = np.asarray(axis_dir, dtype=np.float64)
-        n = np.linalg.norm(axis_dir)
-        if n < 1e-12:
-            axis_dir = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        else:
-            axis_dir = axis_dir / n
-
-        p0 = Point()
-        p0.x = float(origin[0])
-        p0.y = float(origin[1])
-        p0.z = float(origin[2])
-
-        p1 = Point()
-        p1.x = float(origin[0] + self.axes_length * axis_dir[0])
-        p1.y = float(origin[1] + self.axes_length * axis_dir[1])
-        p1.z = float(origin[2] + self.axes_length * axis_dir[2])
-
-        m.points = [p0, p1]
-        m.scale.x = float(self.axes_shaft_diameter)
-        m.scale.y = float(self.axes_head_diameter)
-        m.scale.z = float(self.axes_head_length)
-
-        m.color = ColorRGBA(
-            r=float(rgb[0]),
-            g=float(rgb[1]),
-            b=float(rgb[2]),
-            a=1.0
-        )
-
-        if self.axes_lifetime_sec > 0.0:
-            m.lifetime = Duration(seconds=self.axes_lifetime_sec).to_msg()
-
-        return m
-
     def make_sphere_marker(self, header_frame, stamp, marker_id, ns, xyz, radius, rgba):
         m = Marker()
         m.header.frame_id = header_frame
