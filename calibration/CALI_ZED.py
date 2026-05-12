@@ -3,6 +3,7 @@
 import os
 import yaml
 import numpy as np
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -29,23 +30,12 @@ class CaliZedNode(Node):
     """
     CALI_ZED node for master_2.
 
-    Role:
-      - Receives ZED/ArUco marker center as PointStamped.
-      - Converts marker position into base_link.
-      - Selects arm by marker y position.
-      - Looks up item metadata from item_database.yaml.
-      - Publishes ObjectAlign for arm alignment and shelf collision setup.
-
-    Notes:
-      - ARUCO_ZED does not need to know shelf_id/shelf_layer.
-      - Shelf metadata is resolved here from target item DB.
-      - Marker orientation is not used. Only marker position is published.
-
     Subscribe:
       /aruco_zed_start        std_msgs/Bool
       /target_item_name       std_msgs/String
       /target_aruco_id        std_msgs/Int32
       /target_text_prompt     std_msgs/String
+      /target_shelf_id        std_msgs/String
       /aruco/marker_3d_zed    geometry_msgs/PointStamped
 
     Publish:
@@ -58,10 +48,13 @@ class CaliZedNode(Node):
       string label
       string text_prompt
       string selected_arm
-      string shelf_id
-      int32 shelf_layer
+      string shelf_type
       geometry_msgs/Point marker_position
       geometry_msgs/Pose align_pose
+
+    Fixed end-effector orientation:
+      right = (x=0.5, y=-0.5, z=0.5, w=-0.5)
+      left  = (x=0.5, y= 0.5, z=0.5, w= 0.5)
     """
 
     def __init__(self):
@@ -75,6 +68,7 @@ class CaliZedNode(Node):
         self.declare_parameter("target_item_topic", "/target_item_name")
         self.declare_parameter("target_aruco_id_topic", "/target_aruco_id")
         self.declare_parameter("target_text_prompt_topic", "/target_text_prompt")
+        self.declare_parameter("target_shelf_id_topic", "/target_shelf_id")
 
         self.declare_parameter("aruco_input_topic", "/aruco/marker_3d_zed")
         self.declare_parameter("aruco_output_topic", "/aruco/marker_base_pose_zed")
@@ -89,23 +83,27 @@ class CaliZedNode(Node):
         self.declare_parameter("fallback_to_latest_tf", True)
         self.declare_parameter("tf_timeout_sec", 0.2)
 
-        # item DB fallback용. 없어도 master target topics로 동작 가능.
+        # item DB fallback. If unavailable, node still works with target topics from master.
         self.declare_parameter("use_item_database", True)
         self.declare_parameter("item_database_path", "")
         self.declare_parameter("config_package", "master_capstone")
         self.declare_parameter("item_database_file", "item_database.yaml")
 
-        # align_pose 계산용 offset
-        # marker_position + offset = align_pose.position
+        # align_pose position = marker_position + offset
         self.declare_parameter("align_offset_x", 0.0)
         self.declare_parameter("align_offset_y", 0.0)
         self.declare_parameter("align_offset_z", 0.0)
 
-        # align_pose orientation 고정 quaternion
-        self.declare_parameter("align_qx", 0.0)
-        self.declare_parameter("align_qy", 0.0)
-        self.declare_parameter("align_qz", 0.0)
-        self.declare_parameter("align_qw", 1.0)
+        # align_pose orientation fixed quaternion by selected arm
+        self.declare_parameter("right_align_qx", 0.5)
+        self.declare_parameter("right_align_qy", -0.5)
+        self.declare_parameter("right_align_qz", 0.5)
+        self.declare_parameter("right_align_qw", -0.5)
+
+        self.declare_parameter("left_align_qx", 0.5)
+        self.declare_parameter("left_align_qy", -0.5)
+        self.declare_parameter("left_align_qz", 0.5)
+        self.declare_parameter("left_align_qw", -0.5)
 
         self.declare_parameter("debug", True)
         self.declare_parameter("print_tf_matrix", False)
@@ -121,6 +119,7 @@ class CaliZedNode(Node):
         self.target_item_topic = self.get_parameter("target_item_topic").value
         self.target_aruco_id_topic = self.get_parameter("target_aruco_id_topic").value
         self.target_text_prompt_topic = self.get_parameter("target_text_prompt_topic").value
+        self.target_shelf_id_topic = self.get_parameter("target_shelf_id_topic").value
 
         self.aruco_input_topic = self.get_parameter("aruco_input_topic").value
         self.aruco_output_topic = self.get_parameter("aruco_output_topic").value
@@ -139,10 +138,15 @@ class CaliZedNode(Node):
         self.align_offset_y = float(self.get_parameter("align_offset_y").value)
         self.align_offset_z = float(self.get_parameter("align_offset_z").value)
 
-        self.align_qx = float(self.get_parameter("align_qx").value)
-        self.align_qy = float(self.get_parameter("align_qy").value)
-        self.align_qz = float(self.get_parameter("align_qz").value)
-        self.align_qw = float(self.get_parameter("align_qw").value)
+        self.right_align_qx = float(self.get_parameter("right_align_qx").value)
+        self.right_align_qy = float(self.get_parameter("right_align_qy").value)
+        self.right_align_qz = float(self.get_parameter("right_align_qz").value)
+        self.right_align_qw = float(self.get_parameter("right_align_qw").value)
+
+        self.left_align_qx = float(self.get_parameter("left_align_qx").value)
+        self.left_align_qy = float(self.get_parameter("left_align_qy").value)
+        self.left_align_qz = float(self.get_parameter("left_align_qz").value)
+        self.left_align_qw = float(self.get_parameter("left_align_qw").value)
 
         self.debug = bool(self.get_parameter("debug").value)
         self.print_tf_matrix = bool(self.get_parameter("print_tf_matrix").value)
@@ -158,12 +162,15 @@ class CaliZedNode(Node):
         self.current_item_name = ""
         self.current_aruco_id = -1
         self.current_text_prompt = ""
-        self.current_shelf_id = ""
-        self.current_shelf_layer = -1
+        self.current_shelf_type = ""
 
         # ==================================================
         # QoS
         # ==================================================
+        # Command / one-shot important result QoS.
+        # IMPORTANT:
+        #   /object_align_result publisher uses this QoS, so arm_picking subscriber
+        #   must use RELIABLE + TRANSIENT_LOCAL + KEEP_LAST + depth=1.
         self.qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -192,13 +199,23 @@ class CaliZedNode(Node):
         self.create_subscription(String, self.target_item_topic, self.target_item_cb, self.qos_cmd)
         self.create_subscription(Int32, self.target_aruco_id_topic, self.target_aruco_id_cb, self.qos_cmd)
         self.create_subscription(String, self.target_text_prompt_topic, self.target_text_prompt_cb, self.qos_cmd)
+        self.create_subscription(String, self.target_shelf_id_topic, self.target_shelf_id_cb, self.qos_cmd)
+
+        # Aruco marker stream can remain default QoS.
         self.create_subscription(PointStamped, self.aruco_input_topic, self.aruco_callback, 10)
 
         # ==================================================
         # Publishers
         # ==================================================
+        # Debug/transformed marker output; not critical, keep default QoS.
         self.pub_aruco_base = self.create_publisher(PointStamped, self.aruco_output_topic, 10)
-        self.pub_object_align = self.create_publisher(ObjectAlign, self.object_align_output_topic, 10)
+
+        # Important one-shot ObjectAlign output. Must match arm_picking subscriber QoS.
+        self.pub_object_align = self.create_publisher(
+            ObjectAlign,
+            self.object_align_output_topic,
+            self.qos_cmd,
+        )
 
         self.get_logger().info("========================================")
         self.get_logger().info("CALI_ZED node started")
@@ -207,14 +224,23 @@ class CaliZedNode(Node):
         self.get_logger().info(f"target_item_topic          : {self.target_item_topic}")
         self.get_logger().info(f"target_aruco_id_topic      : {self.target_aruco_id_topic}")
         self.get_logger().info(f"target_text_prompt_topic   : {self.target_text_prompt_topic}")
+        self.get_logger().info(f"target_shelf_id_topic      : {self.target_shelf_id_topic}")
         self.get_logger().info(f"aruco_input_topic          : {self.aruco_input_topic}")
         self.get_logger().info(f"aruco_output_topic         : {self.aruco_output_topic}")
         self.get_logger().info(f"object_align_output_topic  : {self.object_align_output_topic}")
+        self.get_logger().info("object_align QoS           : RELIABLE / TRANSIENT_LOCAL / KEEP_LAST / depth=1")
         self.get_logger().info(f"base_frame                 : {self.base_frame}")
         self.get_logger().info(f"align_offset               : ({self.align_offset_x}, {self.align_offset_y}, {self.align_offset_z})")
-        self.get_logger().info(f"align_quaternion           : ({self.align_qx}, {self.align_qy}, {self.align_qz}, {self.align_qw})")
+        self.get_logger().info(
+            f"right_align_quaternion     : ({self.right_align_qx}, {self.right_align_qy}, "
+            f"{self.right_align_qz}, {self.right_align_qw})"
+        )
+        self.get_logger().info(
+            f"left_align_quaternion      : ({self.left_align_qx}, {self.left_align_qy}, "
+            f"{self.left_align_qz}, {self.left_align_qw})"
+        )
         self.get_logger().info("ARM RULE: base_link y < 0 -> right, y >= 0 -> left")
-        self.get_logger().info("SHELF METADATA: item_database.yaml -> ObjectAlign.shelf_id / shelf_layer")
+        self.get_logger().info("SHELF METADATA: item_database.yaml shelf_id -> ObjectAlign.shelf_type")
         if self.db_metadata:
             self.get_logger().info(f"DB metadata                : {self.db_metadata}")
         self.get_logger().info("========================================")
@@ -298,16 +324,15 @@ class CaliZedNode(Node):
         if self.active:
             self.published_this_start = False
             self.get_logger().info(
-                f"[START] /aruco_zed_start true. "
+                f"[START] {self.start_topic} true. "
                 f"item='{self.current_item_name}', "
                 f"aruco_id={self.current_aruco_id}, "
                 f"prompt='{self.current_text_prompt}', "
-                f"shelf_id='{self.current_shelf_id}', "
-                f"shelf_layer={self.current_shelf_layer}"
+                f"shelf_type='{self.current_shelf_type}'"
             )
         else:
             self.published_this_start = False
-            self.get_logger().info("[STOP] /aruco_zed_start false. ObjectAlign publish paused.")
+            self.get_logger().info(f"[STOP] {self.start_topic} false. ObjectAlign publish paused.")
 
     def target_item_cb(self, msg: String):
         item_name = msg.data.strip()
@@ -321,13 +346,12 @@ class CaliZedNode(Node):
                 "item_id": item_name,
                 "product_name": item_name,
             }
-            self.current_shelf_id = ""
-            self.current_shelf_layer = -1
 
+            # Keep shelf_type from /target_shelf_id if master publishes it.
             self.get_logger().info(
                 f"[TARGET ITEM] '{item_name}' received. "
-                f"No DB match. Will use master /target_aruco_id and /target_text_prompt. "
-                f"shelf_id='', shelf_layer=-1"
+                f"No DB match. Will use master /target_aruco_id, /target_text_prompt, /target_shelf_id. "
+                f"current shelf_type='{self.current_shelf_type}'"
             )
             return
 
@@ -340,14 +364,9 @@ class CaliZedNode(Node):
         if "text_prompt" in item:
             self.current_text_prompt = str(item["text_prompt"])
 
-        self.current_shelf_id = str(item.get("shelf_id", ""))
-        try:
-            self.current_shelf_layer = int(item.get("shelf_layer", -1))
-        except Exception:
-            self.current_shelf_layer = -1
-            self.get_logger().warn(
-                f"[TARGET ITEM] invalid shelf_layer for item='{item_name}': {item.get('shelf_layer')} -> -1"
-            )
+        # Current ObjectAlign.msg uses shelf_type only.
+        # The DB key may still be named shelf_id, so map DB shelf_id -> ObjectAlign.shelf_type.
+        self.current_shelf_type = str(item.get("shelf_type", item.get("shelf_id", "")))
 
         self.get_logger().info(
             "\n"
@@ -357,8 +376,7 @@ class CaliZedNode(Node):
             f"product_name : {item.get('product_name')}\n"
             f"text_prompt  : {self.current_text_prompt}\n"
             f"aruco_id     : {self.current_aruco_id}\n"
-            f"shelf_id     : {self.current_shelf_id}\n"
-            f"shelf_layer  : {self.current_shelf_layer}"
+            f"shelf_type   : {self.current_shelf_type}"
         )
 
     def target_aruco_id_cb(self, msg: Int32):
@@ -368,6 +386,13 @@ class CaliZedNode(Node):
     def target_text_prompt_cb(self, msg: String):
         self.current_text_prompt = msg.data.strip()
         self.get_logger().info(f"[TARGET TEXT PROMPT UPDATED] text_prompt='{self.current_text_prompt}'")
+
+    def target_shelf_id_cb(self, msg: String):
+        # Master DB field name is shelf_id, ObjectAlign field name is shelf_type.
+        shelf_type = msg.data.strip()
+        if shelf_type:
+            self.current_shelf_type = shelf_type
+        self.get_logger().info(f"[TARGET SHELF UPDATED] shelf_type='{self.current_shelf_type}'")
 
     # ==================================================
     # Aruco callback
@@ -400,7 +425,7 @@ class CaliZedNode(Node):
 
         if self.publish_once_per_start:
             self.active = False
-            self.get_logger().info("[CALI_ZED] ObjectAlign published once; auto-paused until next /aruco_zed_start true.")
+            self.get_logger().info("[CALI_ZED] ObjectAlign published once; auto-paused until next start true.")
 
     # ==================================================
     # Transform
@@ -481,29 +506,37 @@ class CaliZedNode(Node):
         out.text_prompt = str(self.current_text_prompt)
         out.selected_arm = selected_arm
 
-        # Added for shelf collision model placement in ARM_PICKING.
-        out.shelf_id = str(self.current_shelf_id)
-        out.shelf_layer = int(self.current_shelf_layer)
+        # item_database.yaml uses shelf_id, ObjectAlign.msg uses shelf_type.
+        # Actual values must be "shelf_1" or "shelf_2" according to DB.
+        out.shelf_type = str(self.current_shelf_type)
 
         out.marker_position.x = float(p_base[0])
         out.marker_position.y = float(p_base[1])
         out.marker_position.z = float(p_base[2])
 
-        out.align_pose = self.make_align_pose(p_base)
+        out.align_pose = self.make_align_pose(p_base, selected_arm)
 
-        self.pub_object_align.publish(out)
+        for i in range(5):
+            self.pub_object_align.publish(out)
+            self.get_logger().info(
+                f"[ObjectAlign PUBLISH REPEAT] {i + 1}/5"
+            )
+            time.sleep(0.05)
 
         self.get_logger().info(
             "\n"
             "[ObjectAlign PUBLISHED]\n"
+            f"topic           : {self.object_align_output_topic}\n"
+            f"qos             : RELIABLE / TRANSIENT_LOCAL / KEEP_LAST / depth=1\n"
             f"aruco_id        : {out.aruco_id}\n"
             f"label           : {out.label}\n"
             f"text_prompt     : {out.text_prompt}\n"
             f"selected_arm    : {out.selected_arm}\n"
-            f"shelf_id        : {out.shelf_id}\n"
-            f"shelf_layer     : {out.shelf_layer}\n"
+            f"shelf_type      : {out.shelf_type}\n"
             f"marker_position : ({out.marker_position.x:.4f}, {out.marker_position.y:.4f}, {out.marker_position.z:.4f})\n"
-            f"align_position  : ({out.align_pose.position.x:.4f}, {out.align_pose.position.y:.4f}, {out.align_pose.position.z:.4f})"
+            f"align_position  : ({out.align_pose.position.x:.4f}, {out.align_pose.position.y:.4f}, {out.align_pose.position.z:.4f})\n"
+            f"align_quat      : ({out.align_pose.orientation.x:.4f}, {out.align_pose.orientation.y:.4f}, "
+            f"{out.align_pose.orientation.z:.4f}, {out.align_pose.orientation.w:.4f})"
         )
 
     def resolve_label(self) -> str:
@@ -518,17 +551,24 @@ class CaliZedNode(Node):
 
         return "unknown"
 
-    def make_align_pose(self, p_base: np.ndarray) -> Pose:
+    def make_align_pose(self, p_base: np.ndarray, selected_arm: str) -> Pose:
         pose = Pose()
 
         pose.position.x = float(p_base[0]) + self.align_offset_x
         pose.position.y = float(p_base[1]) + self.align_offset_y
         pose.position.z = float(p_base[2]) + self.align_offset_z
 
-        pose.orientation.x = self.align_qx
-        pose.orientation.y = self.align_qy
-        pose.orientation.z = self.align_qz
-        pose.orientation.w = self.align_qw
+        arm = (selected_arm or "").strip().lower()
+        if arm == "left":
+            pose.orientation.x = self.left_align_qx
+            pose.orientation.y = self.left_align_qy
+            pose.orientation.z = self.left_align_qz
+            pose.orientation.w = self.left_align_qw
+        else:
+            pose.orientation.x = self.right_align_qx
+            pose.orientation.y = self.right_align_qy
+            pose.orientation.z = self.right_align_qz
+            pose.orientation.w = self.right_align_qw
 
         return pose
 

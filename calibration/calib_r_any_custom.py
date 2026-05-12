@@ -111,6 +111,9 @@ class AnyGraspBaseTransformerRight(Node):
         self.declare_parameter('best_score_input_topic', '/anygrasp/best_score')
         self.declare_parameter('require_matching_stamps', True)
         self.declare_parameter('publish_once_per_stamp', True)
+        self.declare_parameter('require_complete_object_msg', True)
+        self.declare_parameter('object_msg_sync_tolerance_sec', 0.30)
+        self.declare_parameter('object_size_fallback_from_center', [0.06, 0.06, 0.12])
         self.declare_parameter('object_size_min_points', 20)
 
         self.declare_parameter('base_frame', 'base_link')
@@ -199,6 +202,9 @@ class AnyGraspBaseTransformerRight(Node):
         self.best_score_input_topic = self.get_parameter('best_score_input_topic').value
         self.require_matching_stamps = bool(self.get_parameter('require_matching_stamps').value)
         self.publish_once_per_stamp = bool(self.get_parameter('publish_once_per_stamp').value)
+        self.require_complete_object_msg = bool(self.get_parameter('require_complete_object_msg').value)
+        self.object_msg_sync_tolerance_sec = float(self.get_parameter('object_msg_sync_tolerance_sec').value)
+        self.object_size_fallback_from_center = [float(v) for v in self.get_parameter('object_size_fallback_from_center').value]
         self.object_size_min_points = int(self.get_parameter('object_size_min_points').value)
 
         self.base_frame = self.get_parameter('base_frame').value
@@ -391,6 +397,8 @@ class AnyGraspBaseTransformerRight(Node):
         self.get_logger().info(f'final_object_grasp_topic     : {self.final_object_grasp_topic}')
         self.get_logger().info(f'selected_arm_id              : {self.selected_arm_id}')
         self.get_logger().info(f'require_matching_stamps      : {self.require_matching_stamps}')
+        self.get_logger().info(f'object_msg_sync_tolerance_sec: {self.object_msg_sync_tolerance_sec:.3f}')
+        self.get_logger().info(f'require_complete_object_msg  : {self.require_complete_object_msg}')
         self.get_logger().info(f'best_pose_marker_topic        : {self.best_pose_marker_topic}')
         self.get_logger().info(f'best_contact_marker_topic     : {self.best_contact_marker_topic}')
         self.get_logger().info(f'republish_visuals_in_base_link: {self.republish_visuals_in_base_link}')
@@ -516,11 +524,13 @@ class AnyGraspBaseTransformerRight(Node):
         """
         Publish the final planning-level custom message.
 
-        Strict rule:
-          - ObjectGrasp is published only here.
-          - Its frame is always base_frame.
-          - All coordinate fields inside it are base_frame coordinates.
-          - It is emitted only when pose/contact/center/size for the same stamp are available.
+        Important fix:
+          - Float32 width/score have no Header, and PointCloud2/ObjectCenter/Pose
+            callbacks can arrive a few milliseconds apart. The old exact-stamp
+            gate could keep ObjectGrasp from being published even when all data
+            belonged to the same SAM3/AnyGrasp cycle.
+          - We now use a timestamp tolerance for stamped inputs. Width/score are
+            treated as latest scalar state.
         """
         if self.last_pred_pose_base is None:
             return
@@ -530,8 +540,12 @@ class AnyGraspBaseTransformerRight(Node):
             return
         if self.last_grasp_width is None:
             return
+
         if self.last_object_size_base is None:
-            return
+            if self.require_complete_object_msg:
+                return
+            self.last_object_size_base = tuple(self.object_size_fallback_from_center[:3])
+            self.last_object_size_stamp_ns = self.stamp_to_ns(self.last_pred_pose_base.header.stamp)
 
         pose_ns = self.stamp_to_ns(self.last_pred_pose_base.header.stamp)
         contact_ns = self.stamp_to_ns(self.last_contact_point_base.header.stamp)
@@ -539,11 +553,15 @@ class AnyGraspBaseTransformerRight(Node):
         size_ns = self.last_object_size_stamp_ns
 
         if self.require_matching_stamps:
-            if contact_ns != pose_ns or center_ns != pose_ns or size_ns != pose_ns:
+            tol_ns = int(max(0.0, self.object_msg_sync_tolerance_sec) * 1e9)
+            ok_contact = abs(contact_ns - pose_ns) <= tol_ns
+            ok_center = abs(center_ns - pose_ns) <= tol_ns
+            ok_size = size_ns is not None and abs(size_ns - pose_ns) <= tol_ns
+            if not (ok_contact and ok_center and ok_size):
                 if self.verbose_debug:
                     self.get_logger().info(
-                        '[FINAL_OBJECT_GRASP] waiting for matching stamps: '
-                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns}'
+                        '[FINAL_OBJECT_GRASP] waiting for synced inputs: '
+                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns} tol_ns={tol_ns}'
                     )
                 return
 
@@ -554,41 +572,67 @@ class AnyGraspBaseTransformerRight(Node):
         msg.header.stamp = self.last_pred_pose_base.header.stamp
         msg.header.frame_id = self.base_frame
 
-        msg.arm_id = int(self.selected_arm_id)
-        msg.label = str(self.final_label)
-        msg.confidence = float(self.last_grasp_confidence) if self.last_grasp_confidence is not None else 1.0
+        # IMPORTANT:
+        # grasp_msgs/ObjectGrasp differs between workspaces. Some versions do not
+        # contain arm_id/label/confidence. Setting a non-existing ROS message field
+        # raises AttributeError and kills the calib node, so fill only fields that
+        # actually exist in the installed message definition.
+        confidence_value = float(self.last_grasp_confidence) if self.last_grasp_confidence is not None else 1.0
+
+        if hasattr(msg, 'arm_id'):
+            msg.arm_id = int(self.selected_arm_id)
+        if hasattr(msg, 'selected_arm_id'):
+            msg.selected_arm_id = int(self.selected_arm_id)
+        if hasattr(msg, 'label'):
+            msg.label = str(self.final_label)
+        if hasattr(msg, 'object_label'):
+            msg.object_label = str(self.final_label)
+        if hasattr(msg, 'confidence'):
+            msg.confidence = confidence_value
+        if hasattr(msg, 'score'):
+            msg.score = confidence_value
 
         # Object pose: current pipeline provides object center, not a full object orientation.
         # Keep identity orientation to avoid pretending that object orientation was estimated.
-        msg.object_pose.position.x = float(self.last_object_center_base.point.x)
-        msg.object_pose.position.y = float(self.last_object_center_base.point.y)
-        msg.object_pose.position.z = float(self.last_object_center_base.point.z)
-        msg.object_pose.orientation.x = 0.0
-        msg.object_pose.orientation.y = 0.0
-        msg.object_pose.orientation.z = 0.0
-        msg.object_pose.orientation.w = 1.0
+        if hasattr(msg, 'object_pose'):
+            msg.object_pose.position.x = float(self.last_object_center_base.point.x)
+            msg.object_pose.position.y = float(self.last_object_center_base.point.y)
+            msg.object_pose.position.z = float(self.last_object_center_base.point.z)
+            msg.object_pose.orientation.x = 0.0
+            msg.object_pose.orientation.y = 0.0
+            msg.object_pose.orientation.z = 0.0
+            msg.object_pose.orientation.w = 1.0
 
-        msg.object_size.x = float(self.last_object_size_base[0])
-        msg.object_size.y = float(self.last_object_size_base[1])
-        msg.object_size.z = float(self.last_object_size_base[2])
+        if hasattr(msg, 'object_size'):
+            msg.object_size.x = float(self.last_object_size_base[0])
+            msg.object_size.y = float(self.last_object_size_base[1])
+            msg.object_size.z = float(self.last_object_size_base[2])
 
-        msg.grasp_point.x = float(self.last_contact_point_base.point.x)
-        msg.grasp_point.y = float(self.last_contact_point_base.point.y)
-        msg.grasp_point.z = float(self.last_contact_point_base.point.z)
+        if hasattr(msg, 'grasp_point'):
+            msg.grasp_point.x = float(self.last_contact_point_base.point.x)
+            msg.grasp_point.y = float(self.last_contact_point_base.point.y)
+            msg.grasp_point.z = float(self.last_contact_point_base.point.z)
 
-        msg.grasp_pose = copy.deepcopy(self.last_pred_pose_base.pose)
-        msg.grasp_width = float(self.last_grasp_width)
+        if hasattr(msg, 'grasp_pose'):
+            msg.grasp_pose = copy.deepcopy(self.last_pred_pose_base.pose)
+        if hasattr(msg, 'grasp_width'):
+            msg.grasp_width = float(self.last_grasp_width)
+        if hasattr(msg, 'width'):
+            msg.width = float(self.last_grasp_width)
 
         self.pub_object_grasp_final.publish(msg)
         self.last_final_publish_stamp_ns = pose_ns
 
+        arm_log = getattr(msg, 'arm_id', getattr(msg, 'selected_arm_id', self.selected_arm_id))
+        label_log = getattr(msg, 'label', getattr(msg, 'object_label', self.final_label))
+        conf_log = getattr(msg, 'confidence', getattr(msg, 'score', confidence_value))
         self.get_logger().info(
             '[FINAL_OBJECT_GRASP_PUBLISHED] '
-            f'arm_id={msg.arm_id} frame={msg.header.frame_id} '
-            f'center=({msg.object_pose.position.x:.4f},{msg.object_pose.position.y:.4f},{msg.object_pose.position.z:.4f}) '
-            f'size_wdh=({msg.object_size.x:.4f},{msg.object_size.y:.4f},{msg.object_size.z:.4f}) '
-            f'grasp=({msg.grasp_pose.position.x:.4f},{msg.grasp_pose.position.y:.4f},{msg.grasp_pose.position.z:.4f}) '
-            f'grasp_width={msg.grasp_width:.4f} confidence={msg.confidence:.4f}'
+            f'arm_id={arm_log} label={label_log} frame={msg.header.frame_id} '
+            f'center=({self.last_object_center_base.point.x:.4f},{self.last_object_center_base.point.y:.4f},{self.last_object_center_base.point.z:.4f}) '
+            f'size_wdh=({self.last_object_size_base[0]:.4f},{self.last_object_size_base[1]:.4f},{self.last_object_size_base[2]:.4f}) '
+            f'grasp=({self.last_pred_pose_base.pose.position.x:.4f},{self.last_pred_pose_base.pose.position.y:.4f},{self.last_pred_pose_base.pose.position.z:.4f}) '
+            f'grasp_width={self.last_grasp_width:.4f} confidence={conf_log:.4f}'
         )
 
     def estimate_object_size_from_cloud(self, cloud_msg: PointCloud2):

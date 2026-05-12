@@ -193,7 +193,7 @@ class CaliD405Master2Node(Node):
         # Subscriptions
         # ============================================================
         self.create_subscription(Bool, self.start_topic, self.start_callback, self.qos_cmd)
-        self.create_subscription(ObjectAlign, self.object_align_topic, self.object_align_callback, 10)
+        self.create_subscription(ObjectAlign, self.object_align_topic, self.object_align_callback, self.qos_cmd)
 
         self.create_subscription(PoseStamped, self.grasp_pose_input_topic, self.grasp_pose_callback, 10)
         self.create_subscription(PointStamped, self.contact_point_input_topic, self.contact_point_callback, 10)
@@ -208,7 +208,11 @@ class CaliD405Master2Node(Node):
         self.pub_contact_point_base = self.create_publisher(PointStamped, self.contact_point_output_topic, 10)
         self.pub_object_center_base = self.create_publisher(PointStamped, self.object_center_output_topic, 10)
         self.pub_object_pc_base = self.create_publisher(PointCloud2, self.object_pc_output_topic, 10)
-        self.pub_object_grasp = self.create_publisher(ObjectGrasp, self.object_grasp_output_topic, 10)
+        self.pub_object_grasp = self.create_publisher(
+            ObjectGrasp,
+            self.object_grasp_output_topic,
+            self.qos_cmd,
+        )
 
         self.get_logger().info('========================================')
         self.get_logger().info('CALI_D405 MASTER2 Node Ready (LEFT ARM)')
