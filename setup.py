@@ -24,8 +24,6 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'eye_in_hand_l_calibration = calibration.eye_in_hand_l_calibration:main',
-            'eye_in_hand_r_calibration = calibration.eye_in_hand_r_calibration:main',
             'eye_in_hand_calib_any = calibration.eye_in_hand_calib_any:main',
             'eye_in_hand_calib_any_r = calibration.eye_in_hand_calib_any_r:main',
             'eye_in_hand_calib_pub = calibration.eye_in_hand_calib_pub:main',
@@ -33,8 +31,11 @@ setup(
             'eye_in_hand_calib_pub_r = calibration.eye_in_hand_calib_pub_r:main',
             'eye_in_hand_calib_pub_r_point = calibration.eye_in_hand_calib_pub_r_point:main',
             'eye_in_hand_calib_pub_zed_point = calibration.eye_in_hand_calib_pub_zed_point:main',
-            'grasp_calib_debug = calibration.grasp_calib_debug:main',
             'calib_zed = calibration.calib_zed:main',
+            'calib_r_any_custom = calibration.calib_r_any_custom:main',
+            'CALI_ZED = calibration.CALI_ZED:main',
+            'CALI_D405_R = calibration.CALI_D405_R:main',
+            'CALI_D405_L = calibration.CALI_D405_L:main',
         ],
     },
 )

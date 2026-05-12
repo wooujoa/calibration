@@ -9,11 +9,13 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 
 from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped, PoseArray
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float32
 from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 import tf2_ros
+
+from grasp_msgs.msg import ObjectGrasp
 
 
 class AnyGraspBaseTransformerRight(Node):
@@ -100,6 +102,17 @@ class AnyGraspBaseTransformerRight(Node):
         self.declare_parameter('target_pc_input_topic', '/yolo/target_pc')
         self.declare_parameter('target_pc_output_topic', '/yolo/target_pc_base')
 
+        # Final planning message. This is the ONLY place where ObjectGrasp is published.
+        # MASTER should pass the selected arm as a parameter when launching this right/left pipeline.
+        self.declare_parameter('final_object_grasp_topic', '/manipulator/object_grasp_r')
+        self.declare_parameter('selected_arm_id', 2)  # 0 unknown, 1 left, 2 right
+        self.declare_parameter('final_label', 'target_object')
+        self.declare_parameter('best_width_input_topic', '/anygrasp/best_width')
+        self.declare_parameter('best_score_input_topic', '/anygrasp/best_score')
+        self.declare_parameter('require_matching_stamps', True)
+        self.declare_parameter('publish_once_per_stamp', True)
+        self.declare_parameter('object_size_min_points', 20)
+
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('base_frame_candidates', ['base_link', 'lift_link', 'arm_base_link'])
         self.declare_parameter('gripper_frame', 'gripper_r_rh_p12_rn_base')
@@ -179,6 +192,15 @@ class AnyGraspBaseTransformerRight(Node):
         self.target_pc_input_topic = self.get_parameter('target_pc_input_topic').value
         self.target_pc_output_topic = self.get_parameter('target_pc_output_topic').value
 
+        self.final_object_grasp_topic = self.get_parameter('final_object_grasp_topic').value
+        self.selected_arm_id = int(self.get_parameter('selected_arm_id').value)
+        self.final_label = self.get_parameter('final_label').value
+        self.best_width_input_topic = self.get_parameter('best_width_input_topic').value
+        self.best_score_input_topic = self.get_parameter('best_score_input_topic').value
+        self.require_matching_stamps = bool(self.get_parameter('require_matching_stamps').value)
+        self.publish_once_per_stamp = bool(self.get_parameter('publish_once_per_stamp').value)
+        self.object_size_min_points = int(self.get_parameter('object_size_min_points').value)
+
         self.base_frame = self.get_parameter('base_frame').value
         self.base_frame_candidates = list(self.get_parameter('base_frame_candidates').value)
         self.gripper_frame = self.get_parameter('gripper_frame').value
@@ -248,6 +270,11 @@ class AnyGraspBaseTransformerRight(Node):
         self.last_pred_pose_base = None
         self.last_contact_point_base = None
         self.last_object_center_base = None
+        self.last_grasp_width = None
+        self.last_grasp_confidence = None
+        self.last_object_size_base = None
+        self.last_object_size_stamp_ns = None
+        self.last_final_publish_stamp_ns = None
 
         # ------------------------------------------------------------
         # TF2
@@ -270,11 +297,23 @@ class AnyGraspBaseTransformerRight(Node):
         self.sub_target_pc = self.create_subscription(
             PointCloud2, self.target_pc_input_topic, self.target_pc_callback, 10
         )
+        self.sub_best_width = self.create_subscription(
+            Float32, self.best_width_input_topic, self.best_width_callback, 10
+        )
+        self.sub_best_score = self.create_subscription(
+            Float32, self.best_score_input_topic, self.best_score_callback, 10
+        )
+        # Always subscribe to object_pc for final object_size estimation.
+        # This is separate from optional RViz republishing so final ObjectGrasp does not depend on debug settings.
+        self.sub_object_pc_size = self.create_subscription(
+            PointCloud2, self.get_parameter('object_pc_input_topic').value, self.object_pc_size_callback, 10
+        )
 
         self.pub_grasp_pose_base = self.create_publisher(PoseStamped, self.grasp_pose_output_topic, 10)
         self.pub_contact_point_base = self.create_publisher(PointStamped, self.contact_point_output_topic, 10)
         self.pub_object_center_base = self.create_publisher(PointStamped, self.object_center_output_topic, 10)
         self.pub_target_pc_base = self.create_publisher(PointCloud2, self.target_pc_output_topic, 10)
+        self.pub_object_grasp_final = self.create_publisher(ObjectGrasp, self.final_object_grasp_topic, 10)
 
         self.pub_best_pose_marker = self.create_publisher(Marker, self.best_pose_marker_topic, 10)
         self.pub_best_contact_marker = self.create_publisher(Marker, self.best_contact_marker_topic, 10)
@@ -347,6 +386,11 @@ class AnyGraspBaseTransformerRight(Node):
         self.get_logger().info(f'contact_point_output_topic    : {self.contact_point_output_topic}')
         self.get_logger().info(f'object_center_output_topic    : {self.object_center_output_topic}')
         self.get_logger().info(f'target_pc_output_topic        : {self.target_pc_output_topic}')
+        self.get_logger().info(f'best_width_input_topic       : {self.best_width_input_topic}')
+        self.get_logger().info(f'best_score_input_topic       : {self.best_score_input_topic}')
+        self.get_logger().info(f'final_object_grasp_topic     : {self.final_object_grasp_topic}')
+        self.get_logger().info(f'selected_arm_id              : {self.selected_arm_id}')
+        self.get_logger().info(f'require_matching_stamps      : {self.require_matching_stamps}')
         self.get_logger().info(f'best_pose_marker_topic        : {self.best_pose_marker_topic}')
         self.get_logger().info(f'best_contact_marker_topic     : {self.best_contact_marker_topic}')
         self.get_logger().info(f'republish_visuals_in_base_link: {self.republish_visuals_in_base_link}')
@@ -385,6 +429,7 @@ class AnyGraspBaseTransformerRight(Node):
             self.log_point_compact('ANYGRASP_CONTACT_BASE', out, input_frame=msg.header.frame_id)
 
         self.publish_best_contact_point_marker(out)
+        self.try_publish_object_grasp()
 
     def object_center_callback(self, msg: PointStamped):
         out = self.transform_point(msg, 'SAM3_OBJECT_CENTER')
@@ -394,6 +439,7 @@ class AnyGraspBaseTransformerRight(Node):
         self.pub_object_center_base.publish(out)
         self.last_object_center_base = out
         self.log_point_compact('SAM3_OBJECT_CENTER_BASE', out, input_frame=msg.header.frame_id)
+        self.try_publish_object_grasp()
 
     def grasp_pose_callback(self, msg: PoseStamped):
         result = self.transform_pose(msg, 'ANYGRASP_POSE')
@@ -409,6 +455,7 @@ class AnyGraspBaseTransformerRight(Node):
             self.log_pose_axes_compact('ANYGRASP_POSE_BASE_AXES', T_final_base)
 
         self.publish_best_gripper_pose_marker(msg.header.stamp, T_final_base)
+        self.try_publish_object_grasp()
 
     def target_pc_callback(self, msg: PointCloud2):
         out = self.transform_pointcloud(msg, 'YOLO_TARGET_PC')
@@ -423,6 +470,172 @@ class AnyGraspBaseTransformerRight(Node):
                 f'width={out.width} height={out.height} '
                 f'input_frame={msg.header.frame_id}'
             )
+
+
+    def best_width_callback(self, msg: Float32):
+        self.last_grasp_width = float(msg.data)
+        self.try_publish_object_grasp()
+
+    def best_score_callback(self, msg: Float32):
+        self.last_grasp_confidence = float(msg.data)
+        self.try_publish_object_grasp()
+
+    def object_pc_size_callback(self, msg: PointCloud2):
+        """
+        Estimate object W/D/H from the segmented object point cloud.
+        The output is stored for the final ObjectGrasp message only.
+
+        object_size convention:
+          x = width  : smaller horizontal PCA span in base_link
+          y = depth  : larger  horizontal PCA span in base_link
+          z = height : vertical z span in base_link
+
+        This keeps SAM3->AnyGrasp as standard PointCloud2/Image topics and
+        prevents ObjectGrasp from being used before the result is planning-ready.
+        """
+        out_cloud = self.transform_pointcloud(msg, 'YOLO_OBJECT_PC_SIZE')
+        if out_cloud is None:
+            return
+
+        size_tuple = self.estimate_object_size_from_cloud(out_cloud)
+        if size_tuple is None:
+            return
+
+        self.last_object_size_base = size_tuple
+        self.last_object_size_stamp_ns = self.stamp_to_ns(out_cloud.header.stamp)
+
+        if self.log_pointcloud:
+            self.get_logger().info(
+                f'[OBJECT_SIZE_BASE] width={size_tuple[0]:.4f} depth={size_tuple[1]:.4f} '
+                f'height={size_tuple[2]:.4f} frame={out_cloud.header.frame_id}'
+            )
+
+        self.try_publish_object_grasp()
+
+    def try_publish_object_grasp(self):
+        """
+        Publish the final planning-level custom message.
+
+        Strict rule:
+          - ObjectGrasp is published only here.
+          - Its frame is always base_frame.
+          - All coordinate fields inside it are base_frame coordinates.
+          - It is emitted only when pose/contact/center/size for the same stamp are available.
+        """
+        if self.last_pred_pose_base is None:
+            return
+        if self.last_contact_point_base is None:
+            return
+        if self.last_object_center_base is None:
+            return
+        if self.last_grasp_width is None:
+            return
+        if self.last_object_size_base is None:
+            return
+
+        pose_ns = self.stamp_to_ns(self.last_pred_pose_base.header.stamp)
+        contact_ns = self.stamp_to_ns(self.last_contact_point_base.header.stamp)
+        center_ns = self.stamp_to_ns(self.last_object_center_base.header.stamp)
+        size_ns = self.last_object_size_stamp_ns
+
+        if self.require_matching_stamps:
+            if contact_ns != pose_ns or center_ns != pose_ns or size_ns != pose_ns:
+                if self.verbose_debug:
+                    self.get_logger().info(
+                        '[FINAL_OBJECT_GRASP] waiting for matching stamps: '
+                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns}'
+                    )
+                return
+
+        if self.publish_once_per_stamp and self.last_final_publish_stamp_ns == pose_ns:
+            return
+
+        msg = ObjectGrasp()
+        msg.header.stamp = self.last_pred_pose_base.header.stamp
+        msg.header.frame_id = self.base_frame
+
+        msg.arm_id = int(self.selected_arm_id)
+        msg.label = str(self.final_label)
+        msg.confidence = float(self.last_grasp_confidence) if self.last_grasp_confidence is not None else 1.0
+
+        # Object pose: current pipeline provides object center, not a full object orientation.
+        # Keep identity orientation to avoid pretending that object orientation was estimated.
+        msg.object_pose.position.x = float(self.last_object_center_base.point.x)
+        msg.object_pose.position.y = float(self.last_object_center_base.point.y)
+        msg.object_pose.position.z = float(self.last_object_center_base.point.z)
+        msg.object_pose.orientation.x = 0.0
+        msg.object_pose.orientation.y = 0.0
+        msg.object_pose.orientation.z = 0.0
+        msg.object_pose.orientation.w = 1.0
+
+        msg.object_size.x = float(self.last_object_size_base[0])
+        msg.object_size.y = float(self.last_object_size_base[1])
+        msg.object_size.z = float(self.last_object_size_base[2])
+
+        msg.grasp_point.x = float(self.last_contact_point_base.point.x)
+        msg.grasp_point.y = float(self.last_contact_point_base.point.y)
+        msg.grasp_point.z = float(self.last_contact_point_base.point.z)
+
+        msg.grasp_pose = copy.deepcopy(self.last_pred_pose_base.pose)
+        msg.grasp_width = float(self.last_grasp_width)
+
+        self.pub_object_grasp_final.publish(msg)
+        self.last_final_publish_stamp_ns = pose_ns
+
+        self.get_logger().info(
+            '[FINAL_OBJECT_GRASP_PUBLISHED] '
+            f'arm_id={msg.arm_id} frame={msg.header.frame_id} '
+            f'center=({msg.object_pose.position.x:.4f},{msg.object_pose.position.y:.4f},{msg.object_pose.position.z:.4f}) '
+            f'size_wdh=({msg.object_size.x:.4f},{msg.object_size.y:.4f},{msg.object_size.z:.4f}) '
+            f'grasp=({msg.grasp_pose.position.x:.4f},{msg.grasp_pose.position.y:.4f},{msg.grasp_pose.position.z:.4f}) '
+            f'grasp_width={msg.grasp_width:.4f} confidence={msg.confidence:.4f}'
+        )
+
+    def estimate_object_size_from_cloud(self, cloud_msg: PointCloud2):
+        pts = []
+        for p in pc2.read_points(cloud_msg, field_names=['x', 'y', 'z'], skip_nans=True):
+            pts.append([float(p[0]), float(p[1]), float(p[2])])
+
+        if len(pts) < self.object_size_min_points:
+            self.get_logger().warn(
+                f'[OBJECT_SIZE_BASE] too few points: {len(pts)} < {self.object_size_min_points}'
+            )
+            return None
+
+        arr = np.asarray(pts, dtype=np.float64)
+
+        # Robust percentiles reduce the effect of segmentation/depth outliers.
+        z_lo, z_hi = np.percentile(arr[:, 2], [2.0, 98.0])
+        height = max(0.0, float(z_hi - z_lo))
+
+        xy = arr[:, :2]
+        xy_center = np.mean(xy, axis=0)
+        xy0 = xy - xy_center[None, :]
+
+        if xy0.shape[0] >= 3 and np.linalg.norm(xy0) > 1e-9:
+            cov = np.cov(xy0.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            order = np.argsort(eigvals)[::-1]
+            axes = eigvecs[:, order]
+            proj = xy0 @ axes
+            span0 = float(np.percentile(proj[:, 0], 98.0) - np.percentile(proj[:, 0], 2.0))
+            span1 = float(np.percentile(proj[:, 1], 98.0) - np.percentile(proj[:, 1], 2.0))
+            depth = max(span0, span1)
+            width = min(span0, span1)
+        else:
+            x_lo, x_hi = np.percentile(arr[:, 0], [2.0, 98.0])
+            y_lo, y_hi = np.percentile(arr[:, 1], [2.0, 98.0])
+            span_x = float(x_hi - x_lo)
+            span_y = float(y_hi - y_lo)
+            depth = max(span_x, span_y)
+            width = min(span_x, span_y)
+
+        return max(0.0, width), max(0.0, depth), height
+
+    @staticmethod
+    def stamp_to_ns(stamp) -> int:
+        return int(stamp.sec) * 1000000000 + int(stamp.nanosec)
+
 
     # ------------------------------------------------------------
     # Visualization-only republish callbacks
