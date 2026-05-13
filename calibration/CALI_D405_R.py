@@ -109,6 +109,7 @@ class CaliD405Master2Node(Node):
 
         # Final publish behavior
         self.declare_parameter('require_matching_stamps', True)
+        self.declare_parameter('object_msg_sync_tolerance_sec', 0.30)
         self.declare_parameter('publish_once_per_stamp', True)
         # Additional guard against mixing outputs from different perception cycles.
         # Used when exact stamp matching is disabled or when stamps differ slightly.
@@ -162,6 +163,7 @@ class CaliD405Master2Node(Node):
         self.auto_flip_pose_z_180_if_x_points_down = bool(self.get_parameter('auto_flip_pose_z_180_if_x_points_down').value)
         self.x_axis_downward_flip_threshold = float(self.get_parameter('x_axis_downward_flip_threshold').value)
         self.require_matching_stamps = bool(self.get_parameter('require_matching_stamps').value)
+        self.object_msg_sync_tolerance_sec = float(self.get_parameter('object_msg_sync_tolerance_sec').value)
         self.publish_once_per_stamp = bool(self.get_parameter('publish_once_per_stamp').value)
         self.max_input_stamp_delta_sec = float(self.get_parameter('max_input_stamp_delta_sec').value)
         self.object_size_min_points = int(self.get_parameter('object_size_min_points').value)
@@ -271,6 +273,8 @@ class CaliD405Master2Node(Node):
         self.get_logger().info(f'right_gripper_frame      : {self.right_gripper_frame}')
         self.get_logger().info(f'left_gripper_frame       : {self.left_gripper_frame}')
         self.get_logger().info(f'use_direct_camera_tf     : {self.use_direct_camera_tf}')
+        self.get_logger().info(f'require_matching_stamps  : {self.require_matching_stamps}')
+        self.get_logger().info(f'object_msg_sync_tolerance_sec: {self.object_msg_sync_tolerance_sec:.3f}')
         self.get_logger().info('========================================')
 
     # ============================================================
@@ -443,11 +447,21 @@ class CaliD405Master2Node(Node):
         size_ns = self.last_object_size_stamp_ns
 
         if self.require_matching_stamps:
-            if contact_ns != pose_ns or center_ns != pose_ns or size_ns != pose_ns:
+            # SAM3, AnyGrasp, and pointcloud-derived object_size are generated in the
+            # same perception cycle, but their callbacks can arrive a few ms apart.
+            # Use the same tolerance behavior as the working CALI node instead of
+            # requiring exact integer stamp equality. This does not change topics or
+            # state-machine order; it only prevents valid same-cycle results from
+            # being blocked by callback timing.
+            tol_ns = int(max(0.0, self.object_msg_sync_tolerance_sec) * 1e9)
+            ok_contact = abs(contact_ns - pose_ns) <= tol_ns
+            ok_center = abs(center_ns - pose_ns) <= tol_ns
+            ok_size = size_ns is not None and abs(size_ns - pose_ns) <= tol_ns
+            if not (ok_contact and ok_center and ok_size):
                 if self.debug:
                     self.get_logger().info(
-                        '[ObjectGrasp] waiting matching stamps: '
-                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns}'
+                        '[ObjectGrasp] waiting matching stamps within tolerance: '
+                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns} tol_ns={tol_ns}'
                     )
                 return
 
