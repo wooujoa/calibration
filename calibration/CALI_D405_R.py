@@ -9,6 +9,8 @@
 #   geometry_msgs/Vector3 object_size
 #   geometry_msgs/Point grasp_point
 #   geometry_msgs/Pose grasp_pose
+#   geometry_msgs/Point[] grasp_points
+#   geometry_msgs/Pose[] grasp_poses
 
 import copy
 import math
@@ -47,7 +49,8 @@ class CaliD405Master2Node(Node):
         self.declare_parameter('grasp_pose_input_topic', '/anygrasp_r/best_pose_raw')
         self.declare_parameter('contact_point_input_topic', '/anygrasp_r/best_contact_point')
         self.declare_parameter('object_center_input_topic', '/sam3_r/object_center_camera')
-        self.declare_parameter('object_pc_input_topic', '/sam3_r/object_pc')
+        self.declare_parameter('object_pc_input_topic', '/sam3_r/object_pc')  # for object_size only
+        self.declare_parameter('target_pc_input_topic', '/sam3_r/target_pc')   # RViz target cloud
 
         # ============================================================
         # Outputs
@@ -55,16 +58,22 @@ class CaliD405Master2Node(Node):
         self.declare_parameter('grasp_pose_output_topic', '/anygrasp_r/best_pose_base')
         self.declare_parameter('contact_point_output_topic', '/anygrasp_r/best_contact_point_base')
         self.declare_parameter('object_center_output_topic', '/sam3_r/object_center_base')
-        self.declare_parameter('object_pc_output_topic', '/sam3_r/object_pc_base')
+        self.declare_parameter('target_pc_output_topic', '/sam3_r/target_pc_base')
         self.declare_parameter('object_grasp_output_topic', '/object_grasp_result')
 
         # ============================================================
         # RViz visualization outputs only (base_link frame)
         # ============================================================
         self.declare_parameter('grasps_input_topic', '/anygrasp_r/grasps')
-        self.declare_parameter('grasps_base_topic', '/anygrasp_r/grasps_base')
         self.declare_parameter('grasp_markers_base_topic', '/anygrasp_r/grasp_markers_base')
         self.declare_parameter('best_pose_marker_base_topic', '/anygrasp_r/best_pose_marker_base')
+        # Best grasp axis visualization. Use this MarkerArray in RViz to see the final grasp frame clearly.
+        # X=red, Y=green, Z=blue, all expressed in base_link.
+        self.declare_parameter('best_pose_axes_base_topic', '/anygrasp_r/best_pose_axes_base')
+        self.declare_parameter('best_axis_length', 0.10)
+        self.declare_parameter('best_axis_shaft_diameter', 0.008)
+        self.declare_parameter('best_axis_head_diameter', 0.018)
+        self.declare_parameter('best_axis_head_length', 0.030)
         self.declare_parameter('candidate_marker_topk', 30)
         # RViz gripper-wire visualization. Same idea as AnyGrasp original LINE_LIST marker.
         self.declare_parameter('marker_alpha', 0.85)
@@ -129,17 +138,22 @@ class CaliD405Master2Node(Node):
         self.contact_point_input_topic = self.get_parameter('contact_point_input_topic').value
         self.object_center_input_topic = self.get_parameter('object_center_input_topic').value
         self.object_pc_input_topic = self.get_parameter('object_pc_input_topic').value
+        self.target_pc_input_topic = self.get_parameter('target_pc_input_topic').value
 
         self.grasp_pose_output_topic = self.get_parameter('grasp_pose_output_topic').value
         self.contact_point_output_topic = self.get_parameter('contact_point_output_topic').value
         self.object_center_output_topic = self.get_parameter('object_center_output_topic').value
-        self.object_pc_output_topic = self.get_parameter('object_pc_output_topic').value
+        self.target_pc_output_topic = self.get_parameter('target_pc_output_topic').value
         self.object_grasp_output_topic = self.get_parameter('object_grasp_output_topic').value
 
         self.grasps_input_topic = self.get_parameter('grasps_input_topic').value
-        self.grasps_base_topic = self.get_parameter('grasps_base_topic').value
         self.grasp_markers_base_topic = self.get_parameter('grasp_markers_base_topic').value
         self.best_pose_marker_base_topic = self.get_parameter('best_pose_marker_base_topic').value
+        self.best_pose_axes_base_topic = self.get_parameter('best_pose_axes_base_topic').value
+        self.best_axis_length = float(self.get_parameter('best_axis_length').value)
+        self.best_axis_shaft_diameter = float(self.get_parameter('best_axis_shaft_diameter').value)
+        self.best_axis_head_diameter = float(self.get_parameter('best_axis_head_diameter').value)
+        self.best_axis_head_length = float(self.get_parameter('best_axis_head_length').value)
         self.candidate_marker_topk = int(self.get_parameter('candidate_marker_topk').value)
         self.marker_alpha = float(self.get_parameter('marker_alpha').value)
         self.best_gripper_line_width = float(self.get_parameter('best_gripper_line_width').value)
@@ -211,6 +225,7 @@ class CaliD405Master2Node(Node):
         self.last_object_center_base: PointStamped = None
         self.last_object_size_base = None
         self.last_object_size_stamp_ns = None
+        self.last_candidate_poses_base: PoseArray = None
         self.last_final_publish_stamp_ns = None
 
         # ============================================================
@@ -236,6 +251,7 @@ class CaliD405Master2Node(Node):
         self.create_subscription(PointStamped, self.contact_point_input_topic, self.contact_point_callback, 10)
         self.create_subscription(PointStamped, self.object_center_input_topic, self.object_center_callback, 10)
         self.create_subscription(PointCloud2, self.object_pc_input_topic, self.object_pc_callback, 10)
+        self.create_subscription(PointCloud2, self.target_pc_input_topic, self.target_pc_callback, 10)
         self.create_subscription(PoseArray, self.grasps_input_topic, self.grasps_visualization_callback, 10)
 
         # ============================================================
@@ -245,30 +261,32 @@ class CaliD405Master2Node(Node):
         self.pub_grasp_pose_base = self.create_publisher(PoseStamped, self.grasp_pose_output_topic, 10)
         self.pub_contact_point_base = self.create_publisher(PointStamped, self.contact_point_output_topic, 10)
         self.pub_object_center_base = self.create_publisher(PointStamped, self.object_center_output_topic, 10)
-        self.pub_object_pc_base = self.create_publisher(PointCloud2, self.object_pc_output_topic, 10)
+        self.pub_target_pc_base = self.create_publisher(PointCloud2, self.target_pc_output_topic, 10)
         self.pub_object_grasp = self.create_publisher(
             ObjectGrasp,
             self.object_grasp_output_topic,
             self.qos_cmd,
         )
-        self.pub_grasps_base = self.create_publisher(PoseArray, self.grasps_base_topic, 10)
         self.pub_grasp_markers_base = self.create_publisher(MarkerArray, self.grasp_markers_base_topic, 10)
         self.pub_best_pose_marker_base = self.create_publisher(Marker, self.best_pose_marker_base_topic, 10)
+        self.pub_best_pose_axes_base = self.create_publisher(MarkerArray, self.best_pose_axes_base_topic, 10)
 
         self.get_logger().info('========================================')
-        self.get_logger().info('CALI_D405 MASTER2 Node Ready (RIGHT ARM)')
+        self.get_logger().info('CALI_D405 MASTER2 Node Ready (RIGHT ARM, OBJECTGRASP ARRAY CANDIDATES)')
         self.get_logger().info(f'start_topic              : {self.start_topic}')
         self.get_logger().info(f'object_align_topic       : {self.object_align_topic}')
         self.get_logger().info(f'forced_selected_arm      : {self.forced_selected_arm}')
         self.get_logger().info(f'object_grasp_output_topic: {self.object_grasp_output_topic}')
         self.get_logger().info(f'grasps_input_topic       : {self.grasps_input_topic}')
-        self.get_logger().info(f'grasps_base_topic        : {self.grasps_base_topic}')
         self.get_logger().info(f'grasp_markers_base_topic : {self.grasp_markers_base_topic}')
-        self.get_logger().info(f'best_pose_marker_base    : {self.best_pose_marker_base_topic}')
+        self.get_logger().info(f'best_pose_marker_base    : {self.best_pose_marker_base_topic}  # legacy single marker')
+        self.get_logger().info(f'best_pose_axes_base      : {self.best_pose_axes_base_topic}  # use this in RViz as MarkerArray')
         self.get_logger().info(f'grasp_pose_input_topic   : {self.grasp_pose_input_topic}')
         self.get_logger().info(f'contact_point_input_topic: {self.contact_point_input_topic}')
         self.get_logger().info(f'object_center_input_topic: {self.object_center_input_topic}')
-        self.get_logger().info(f'object_pc_input_topic    : {self.object_pc_input_topic}')
+        self.get_logger().info(f'object_pc_input_topic    : {self.object_pc_input_topic}  # size only')
+        self.get_logger().info(f'target_pc_input_topic    : {self.target_pc_input_topic}')
+        self.get_logger().info(f'target_pc_output_topic   : {self.target_pc_output_topic}')
         self.get_logger().info(f'base_frame               : {self.base_frame}')
         self.get_logger().info(f'right_gripper_frame      : {self.right_gripper_frame}')
         self.get_logger().info(f'left_gripper_frame       : {self.left_gripper_frame}')
@@ -331,6 +349,7 @@ class CaliD405Master2Node(Node):
         self.last_object_center_base = None
         self.last_object_size_base = None
         self.last_object_size_stamp_ns = None
+        self.last_candidate_poses_base: PoseArray = None
         self.last_final_publish_stamp_ns = None
 
     # ============================================================
@@ -372,14 +391,12 @@ class CaliD405Master2Node(Node):
         self.try_publish_object_grasp()
 
     def object_pc_callback(self, msg: PointCloud2):
-        # Visualization output is always converted to base_link for RViz.
-        out_cloud = self.transform_pointcloud(msg, 'OBJECT_PC')
-        if out_cloud is None:
-            return
-        self.pub_object_pc_base.publish(out_cloud)
-
-        # Keep the original ObjectGrasp behavior unchanged: only estimate/store size when active.
+        # Object_pc is used for object_size estimation only. It is not republished
+        # as an RViz topic because the requested visible cloud is target_pc_base.
         if not self.active:
+            return
+        out_cloud = self.transform_pointcloud(msg, 'OBJECT_PC_SIZE')
+        if out_cloud is None:
             return
         size = self.estimate_object_size_from_cloud(out_cloud)
         if size is None:
@@ -388,9 +405,27 @@ class CaliD405Master2Node(Node):
         self.last_object_size_stamp_ns = self.stamp_to_ns(out_cloud.header.stamp)
         self.try_publish_object_grasp()
 
+    def target_pc_callback(self, msg: PointCloud2):
+        # The only point cloud intended for RViz: segmented target cloud in base_link.
+        out_cloud = self.transform_pointcloud(msg, 'TARGET_PC_VIS')
+        if out_cloud is None:
+            return
+        self.pub_target_pc_base.publish(out_cloud)
+
+
+
     def grasps_visualization_callback(self, msg: PoseArray):
         # This callback is visualization-only. It does not touch ObjectGrasp runtime state.
         if len(msg.poses) == 0:
+            if self.active:
+                self.last_candidate_poses_base = None
+            empty = MarkerArray()
+            dm = Marker()
+            dm.header.stamp = msg.header.stamp
+            dm.header.frame_id = self.base_frame
+            dm.action = Marker.DELETEALL
+            empty.markers.append(dm)
+            self.pub_grasp_markers_base.publish(empty)
             return
         out = PoseArray()
         out.header.stamp = msg.header.stamp
@@ -422,7 +457,29 @@ class CaliD405Master2Node(Node):
 
         if len(out.poses) == 0:
             return
-        self.pub_grasps_base.publish(out)
+
+        if self.active:
+            # /anygrasp_r/grasps already contains only the 1st-filtered candidates.
+            # Store the whole candidate list in base_link. candidates[0] is kept as
+            # the best AnyGrasp/CALI-side candidate, but final feasibility selection
+            # is delegated to the robot arm node.
+            self.last_candidate_poses_base = out
+
+            # Keep legacy scalar fields consistent with candidates[0].
+            first_pose = PoseStamped()
+            first_pose.header = out.header
+            first_pose.pose = copy.deepcopy(out.poses[0])
+            self.last_pred_pose_base = first_pose
+
+            first_point = PointStamped()
+            first_point.header = out.header
+            first_point.point.x = float(out.poses[0].position.x)
+            first_point.point.y = float(out.poses[0].position.y)
+            first_point.point.z = float(out.poses[0].position.z)
+            self.last_contact_point_base = first_point
+
+            self.try_publish_object_grasp()
+
         self.publish_grasp_markers_base(out)
 
 
@@ -430,60 +487,77 @@ class CaliD405Master2Node(Node):
     # Final ObjectGrasp
     # ============================================================
     def try_publish_object_grasp(self):
+        """
+        Publish one ObjectGrasp.msg that contains all 1st-filtered candidates.
+
+        Message contract used by this node:
+          - ObjectGrasp.grasp_point / ObjectGrasp.grasp_pose
+              = representative candidate, i.e. candidate[0]
+          - ObjectGrasp.grasp_points[] / ObjectGrasp.grasp_poses[]
+              = all candidates that passed AnyGrasp/SAM3 1st filtering
+        Therefore /object_grasp_result is published ONCE per perception cycle.
+        The robot arm node should iterate over msg.grasp_poses and run IK/collision
+        checks there, then select the final executable candidate.
+        """
         if not self.active:
             return
-        if self.last_pred_pose_base is None:
-            return
-        if self.last_contact_point_base is None:
+        if self.last_candidate_poses_base is None or len(self.last_candidate_poses_base.poses) == 0:
             return
         if self.last_object_center_base is None:
             return
         if self.last_object_size_base is None:
             return
 
-        pose_ns = self.stamp_to_ns(self.last_pred_pose_base.header.stamp)
-        contact_ns = self.stamp_to_ns(self.last_contact_point_base.header.stamp)
+        pose_ns = self.stamp_to_ns(self.last_candidate_poses_base.header.stamp)
         center_ns = self.stamp_to_ns(self.last_object_center_base.header.stamp)
         size_ns = self.last_object_size_stamp_ns
 
         if self.require_matching_stamps:
-            # SAM3, AnyGrasp, and pointcloud-derived object_size are generated in the
-            # same perception cycle, but their callbacks can arrive a few ms apart.
-            # Use the same tolerance behavior as the working CALI node instead of
-            # requiring exact integer stamp equality. This does not change topics or
-            # state-machine order; it only prevents valid same-cycle results from
-            # being blocked by callback timing.
             tol_ns = int(max(0.0, self.object_msg_sync_tolerance_sec) * 1e9)
-            ok_contact = abs(contact_ns - pose_ns) <= tol_ns
             ok_center = abs(center_ns - pose_ns) <= tol_ns
             ok_size = size_ns is not None and abs(size_ns - pose_ns) <= tol_ns
-            if not (ok_contact and ok_center and ok_size):
+            if not (ok_center and ok_size):
                 if self.debug:
                     self.get_logger().info(
                         '[ObjectGrasp] waiting matching stamps within tolerance: '
-                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns} tol_ns={tol_ns}'
+                        f'candidates={pose_ns} center={center_ns} size={size_ns} tol_ns={tol_ns}'
                     )
                 return
 
         if self.max_input_stamp_delta_sec >= 0.0:
-            stamps = [pose_ns, contact_ns, center_ns, size_ns]
+            stamps = [pose_ns, center_ns, size_ns]
             dt_sec = (max(stamps) - min(stamps)) * 1e-9
             if dt_sec > self.max_input_stamp_delta_sec:
                 if self.debug:
                     self.get_logger().warn(
                         '[ObjectGrasp] input stamps are too far apart. '
                         f'delta={dt_sec:.3f}s > {self.max_input_stamp_delta_sec:.3f}s | '
-                        f'pose={pose_ns} contact={contact_ns} center={center_ns} size={size_ns}'
+                        f'candidates={pose_ns} center={center_ns} size={size_ns}'
                     )
                 return
 
         if self.publish_once_per_stamp and self.last_final_publish_stamp_ns == pose_ns:
             return
 
-        msg = ObjectGrasp()
-        msg.header.stamp = self.last_pred_pose_base.header.stamp
-        msg.header.frame_id = self.base_frame
+        header = copy.deepcopy(self.last_candidate_poses_base.header)
+        header.frame_id = self.base_frame
 
+        poses = [copy.deepcopy(p) for p in self.last_candidate_poses_base.poses]
+        candidate_count = len(poses)
+        if candidate_count == 0:
+            return
+
+
+        points = []
+        for pose in poses:
+            p = Point()
+            p.x = float(pose.position.x)
+            p.y = float(pose.position.y)
+            p.z = float(pose.position.z)
+            points.append(p)
+
+        msg = ObjectGrasp()
+        msg.header = copy.deepcopy(header)
         msg.label = str(self.current_label)
         msg.selected_arm = str(self.current_selected_arm)
 
@@ -499,11 +573,14 @@ class CaliD405Master2Node(Node):
         msg.object_size.y = float(self.last_object_size_base[1])
         msg.object_size.z = float(self.last_object_size_base[2])
 
-        msg.grasp_point.x = float(self.last_contact_point_base.point.x)
-        msg.grasp_point.y = float(self.last_contact_point_base.point.y)
-        msg.grasp_point.z = float(self.last_contact_point_base.point.z)
+        # Legacy/single-result fields are kept as candidate[0].
+        msg.grasp_point = copy.deepcopy(points[0])
+        msg.grasp_pose = copy.deepcopy(poses[0])
 
-        msg.grasp_pose = copy.deepcopy(self.last_pred_pose_base.pose)
+        # New array fields: all 1st-filtered candidates in base_link.
+        # These fields require the updated ObjectGrasp.msg provided with this answer.
+        msg.grasp_points = points
+        msg.grasp_poses = poses
 
         self.pub_object_grasp.publish(msg)
         self.last_final_publish_stamp_ns = pose_ns
@@ -511,29 +588,117 @@ class CaliD405Master2Node(Node):
         self.publish_finish(True)
 
         self.get_logger().info(
-            '[ObjectGrasp PUBLISHED] '
-            f'label={msg.label} arm={msg.selected_arm} '
-            f'center=({msg.object_pose.position.x:.4f},{msg.object_pose.position.y:.4f},{msg.object_pose.position.z:.4f}) '
-            f'size=({msg.object_size.x:.4f},{msg.object_size.y:.4f},{msg.object_size.z:.4f}) '
-            f'grasp=({msg.grasp_pose.position.x:.4f},{msg.grasp_pose.position.y:.4f},{msg.grasp_pose.position.z:.4f})'
+            '[ObjectGrasp ARRAY PUBLISHED] '
+            f'label={msg.label} arm={msg.selected_arm} count={candidate_count} '
+            f'best=({msg.grasp_pose.position.x:.4f},'
+            f'{msg.grasp_pose.position.y:.4f},'
+            f'{msg.grasp_pose.position.z:.4f}) '
+            f'center=({msg.object_pose.position.x:.4f},'
+            f'{msg.object_pose.position.y:.4f},'
+            f'{msg.object_pose.position.z:.4f}) '
+            f'size=({msg.object_size.x:.4f},'
+            f'{msg.object_size.y:.4f},'
+            f'{msg.object_size.z:.4f})'
         )
 
     # ============================================================
     # RViz visualization helpers only
     # ============================================================
     def publish_best_pose_marker_base(self, pose_msg: PoseStamped):
-        markers = MarkerArray()
-        markers.markers.extend(self.make_gripper_wire_markers_base(
-            pose_msg.header,
-            pose_msg.pose,
-            idx=0,
-            best=True,
+        """
+        Publish the BEST grasp visualization as an XYZ coordinate frame, not as a gripper wire.
+
+        Important:
+          - Candidate grasps are still shown as gripper wireframes on /anygrasp_r/grasp_markers_base.
+          - The best grasp is shown as axes on /anygrasp_r/best_pose_axes_base.
+          - For the legacy single Marker topic /anygrasp_r/best_pose_marker_base, publish only
+            the best X-axis arrow so old RViz configs do not show the old gripper shape.
+
+        Axis convention in RViz:
+          X: red
+          Y: green
+          Z: blue
+        """
+        axes = self.make_best_pose_axes_markers_base(pose_msg.header, pose_msg.pose)
+        self.pub_best_pose_axes_base.publish(axes)
+
+        # Legacy single-marker topic: publish the X-axis arrow only.
+        # To see the full XYZ frame, add /anygrasp_r/best_pose_axes_base as MarkerArray.
+        for m in axes.markers:
+            if m.action == Marker.ADD and m.ns == 'best_grasp_axis_x':
+                self.pub_best_pose_marker_base.publish(m)
+                break
+
+    def make_best_pose_axes_markers_base(self, header, pose: Pose) -> MarkerArray:
+        """Create a MarkerArray that visualizes the final best grasp pose as XYZ axes."""
+        ma = MarkerArray()
+
+        delete_marker = Marker()
+        delete_marker.header = header
+        delete_marker.action = Marker.DELETEALL
+        ma.markers.append(delete_marker)
+
+        T = self.pose_to_matrix(pose.position, pose.orientation)
+        origin = T[:3, 3].astype(np.float64)
+        x_axis = T[:3, 0].astype(np.float64)
+        y_axis = T[:3, 1].astype(np.float64)
+        z_axis = T[:3, 2].astype(np.float64)
+
+        ma.markers.append(self.make_axis_arrow_marker_base(
+            header, marker_id=1, ns='best_grasp_axis_x', origin=origin, axis=x_axis,
+            color=ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),
+        ))
+        ma.markers.append(self.make_axis_arrow_marker_base(
+            header, marker_id=2, ns='best_grasp_axis_y', origin=origin, axis=y_axis,
+            color=ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),
+        ))
+        ma.markers.append(self.make_axis_arrow_marker_base(
+            header, marker_id=3, ns='best_grasp_axis_z', origin=origin, axis=z_axis,
+            color=ColorRGBA(r=0.1, g=0.35, b=1.0, a=1.0),
         ))
 
-        # Publish only the LINE_LIST marker on the legacy single-marker topic.
-        # The full candidate topic below includes both gripper wire and contact sphere.
-        if len(markers.markers) > 0:
-            self.pub_best_pose_marker_base.publish(markers.markers[0])
+        center = Marker()
+        center.header = header
+        center.ns = 'best_grasp_axis_origin'
+        center.id = 4
+        center.type = Marker.SPHERE
+        center.action = Marker.ADD
+        center.pose.position = copy.deepcopy(pose.position)
+        center.pose.orientation.w = 1.0
+        center.scale.x = self.best_contact_scale * 1.15
+        center.scale.y = self.best_contact_scale * 1.15
+        center.scale.z = self.best_contact_scale * 1.15
+        center.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)
+        ma.markers.append(center)
+        return ma
+
+    def make_axis_arrow_marker_base(self, header, marker_id: int, ns: str, origin: np.ndarray, axis: np.ndarray, color: ColorRGBA) -> Marker:
+        axis = np.asarray(axis, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(axis))
+        if n < 1e-9:
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            axis = axis / n
+
+        p0 = origin.astype(np.float64)
+        p1 = p0 + float(self.best_axis_length) * axis
+
+        marker = Marker()
+        marker.header = header
+        marker.ns = ns
+        marker.id = int(marker_id)
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.points = [
+            Point(x=float(p0[0]), y=float(p0[1]), z=float(p0[2])),
+            Point(x=float(p1[0]), y=float(p1[1]), z=float(p1[2])),
+        ]
+        marker.scale.x = float(self.best_axis_shaft_diameter)
+        marker.scale.y = float(self.best_axis_head_diameter)
+        marker.scale.z = float(self.best_axis_head_length)
+        marker.color = color
+        marker.pose.orientation.w = 1.0
+        return marker
 
     def publish_grasp_markers_base(self, pose_array: PoseArray):
         markers = MarkerArray()
