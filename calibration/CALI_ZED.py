@@ -84,7 +84,7 @@ class CaliZedNode(Node):
         self.declare_parameter("tf_timeout_sec", 0.2)
 
         # item DB fallback. If unavailable, node still works with target topics from master.
-        self.declare_parameter("use_item_database", True)
+        self.declare_parameter("use_item_database", False)
         self.declare_parameter("item_database_path", "")
         self.declare_parameter("config_package", "master_capstone")
         self.declare_parameter("item_database_file", "item_database.yaml")
@@ -110,6 +110,9 @@ class CaliZedNode(Node):
 
         # Repeated INIT2 safety: publish only one ObjectAlign per start pulse.
         self.declare_parameter("publish_once_per_start", True)
+        # If target item belongs to shelf_1, door opening uses the right arm first,
+        # so object alignment / grasping must be forced to the left arm.
+        self.declare_parameter("force_left_arm_for_shelf1", True)
 
         # ==================================================
         # Fetch Parameters
@@ -151,6 +154,7 @@ class CaliZedNode(Node):
         self.debug = bool(self.get_parameter("debug").value)
         self.print_tf_matrix = bool(self.get_parameter("print_tf_matrix").value)
         self.publish_once_per_start = bool(self.get_parameter("publish_once_per_start").value)
+        self.force_left_arm_for_shelf1 = bool(self.get_parameter("force_left_arm_for_shelf1").value)
 
         # ==================================================
         # Runtime state
@@ -240,7 +244,8 @@ class CaliZedNode(Node):
             f"{self.left_align_qz}, {self.left_align_qw})"
         )
         self.get_logger().info("ARM RULE: base_link y < 0 -> right, y >= 0 -> left")
-        self.get_logger().info("SHELF METADATA: item_database.yaml shelf_id -> ObjectAlign.shelf_type")
+        self.get_logger().info(f"SHELF1 ARM OVERRIDE       : force_left_arm_for_shelf1={self.force_left_arm_for_shelf1}")
+        self.get_logger().info("SHELF METADATA: /target_shelf_id from master -> ObjectAlign.shelf_type")
         if self.db_metadata:
             self.get_logger().info(f"DB metadata                : {self.db_metadata}")
         self.get_logger().info("========================================")
@@ -269,7 +274,7 @@ class CaliZedNode(Node):
         if not os.path.exists(yaml_path):
             self.get_logger().warn(
                 f"item_database.yaml not found: {yaml_path}. "
-                f"CALI_ZED can still work with master target topics."
+                f"CALI_ZED ignores local DB for runtime target fields; master topics are authoritative."
             )
             return {}, {}
 
@@ -335,47 +340,36 @@ class CaliZedNode(Node):
             self.get_logger().info(f"[STOP] {self.start_topic} false. ObjectAlign publish paused.")
 
     def target_item_cb(self, msg: String):
+        """Store item label only.
+
+        IMPORTANT:
+          This node must trust the master target topics as the single source
+          of truth. Therefore /target_item_name is used only as a human-readable
+          label/name and never used to look up local item_database.yaml values.
+
+          Authoritative fields are:
+            /target_aruco_id     -> current_aruco_id
+            /target_text_prompt  -> current_text_prompt
+            /target_shelf_id     -> current_shelf_type
+
+        This prevents robot PC / operator PC YAML mismatches from overwriting
+        shelf_type or text_prompt after the master already published them.
+        """
         item_name = msg.data.strip()
         self.current_item_name = item_name
-
-        item = self.find_item_by_name(item_name) if self.item_db else None
-
-        if item is None:
-            self.current_item = {
-                "item_key": item_name,
-                "item_id": item_name,
-                "product_name": item_name,
-            }
-
-            # Keep shelf_type from /target_shelf_id if master publishes it.
-            self.get_logger().info(
-                f"[TARGET ITEM] '{item_name}' received. "
-                f"No DB match. Will use master /target_aruco_id, /target_text_prompt, /target_shelf_id. "
-                f"current shelf_type='{self.current_shelf_type}'"
-            )
-            return
-
-        self.current_item = item
-
-        # Always update from DB. This is required for repeated INIT2 cycles.
-        if "aruco_id" in item:
-            self.current_aruco_id = int(item["aruco_id"])
-
-        if "text_prompt" in item:
-            self.current_text_prompt = str(item["text_prompt"])
-
-        # Current ObjectAlign.msg uses shelf_type only.
-        # The DB key may still be named shelf_id, so map DB shelf_id -> ObjectAlign.shelf_type.
-        self.current_shelf_type = str(item.get("shelf_type", item.get("shelf_id", "")))
+        self.current_item = {
+            "item_key": item_name,
+            "item_id": item_name,
+            "product_name": item_name,
+        }
 
         self.get_logger().info(
             "\n"
-            "[TARGET ITEM UPDATED]\n"
+            "[TARGET ITEM UPDATED - MASTER TOPIC ONLY]\n"
             f"input        : {item_name}\n"
-            f"item_key     : {item.get('item_key')}\n"
-            f"product_name : {item.get('product_name')}\n"
-            f"text_prompt  : {self.current_text_prompt}\n"
+            "source       : /target_item_name only; local item DB ignored\n"
             f"aruco_id     : {self.current_aruco_id}\n"
+            f"text_prompt  : {self.current_text_prompt}\n"
             f"shelf_type   : {self.current_shelf_type}"
         )
 
@@ -494,7 +488,13 @@ class CaliZedNode(Node):
     # ObjectAlign
     # ==================================================
     def publish_object_align(self, original_msg: PointStamped, p_base: np.ndarray):
-        selected_arm = "right" if float(p_base[1]) < 0.0 else "left"
+        shelf_type_norm = str(self.current_shelf_type).strip()
+        if self.force_left_arm_for_shelf1 and shelf_type_norm == "shelf_1":
+            selected_arm = "left"
+            if self.debug:
+                self.get_logger().info("[ARM OVERRIDE] shelf_1 detected -> selected_arm forced to left")
+        else:
+            selected_arm = "right" if float(p_base[1]) < 0.0 else "left"
         label = self.resolve_label()
 
         out = ObjectAlign()

@@ -29,6 +29,7 @@ setup(
             'CALI_ZED = calibration.CALI_ZED:main',
             'CALI_D405_R = calibration.CALI_D405_R:main',
             'CALI_D405_L = calibration.CALI_D405_L:main',
+            'CALI_ZED_DOOR = calibration.CALI_ZED_DOOR:main',
         ],
     },
 )
