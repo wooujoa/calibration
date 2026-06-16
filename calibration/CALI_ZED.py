@@ -42,6 +42,12 @@ class CaliZedNode(Node):
       /aruco/marker_base_pose_zed  geometry_msgs/PointStamped
       /object_align_result         grasp_msgs/ObjectAlign
 
+    Modified behavior:
+      - TF lookup uses latest transform by default.
+      - base_link X/Y are computed from ArUco point.
+      - base_link Z is always forced to forced_base_z = 1.2 m.
+      - ObjectAlign marker_position.z and align_pose.position.z are fixed to 1.2 m.
+
     Required ObjectAlign.msg fields:
       std_msgs/Header header
       int32 aruco_id
@@ -79,7 +85,7 @@ class CaliZedNode(Node):
         self.declare_parameter("use_msg_frame_id", True)
         self.declare_parameter("camera_frame_fallback", "zedm_left_camera_optical_frame")
 
-        self.declare_parameter("use_msg_timestamp", True)
+        self.declare_parameter("use_msg_timestamp", False)
         self.declare_parameter("fallback_to_latest_tf", True)
         self.declare_parameter("tf_timeout_sec", 0.2)
 
@@ -93,6 +99,10 @@ class CaliZedNode(Node):
         self.declare_parameter("align_offset_x", 0.0)
         self.declare_parameter("align_offset_y", 0.0)
         self.declare_parameter("align_offset_z", 0.0)
+
+        # Force final base_link Z regardless of measured ArUco depth/height.
+        # Only base_link X/Y are taken from the transformed ArUco point.
+        self.declare_parameter("forced_base_z", 1.2)
 
         # align_pose orientation fixed quaternion by selected arm
         self.declare_parameter("right_align_qx", 0.5)
@@ -140,6 +150,7 @@ class CaliZedNode(Node):
         self.align_offset_x = float(self.get_parameter("align_offset_x").value)
         self.align_offset_y = float(self.get_parameter("align_offset_y").value)
         self.align_offset_z = float(self.get_parameter("align_offset_z").value)
+        self.forced_base_z = float(self.get_parameter("forced_base_z").value)
 
         self.right_align_qx = float(self.get_parameter("right_align_qx").value)
         self.right_align_qy = float(self.get_parameter("right_align_qy").value)
@@ -235,6 +246,8 @@ class CaliZedNode(Node):
         self.get_logger().info("object_align QoS           : RELIABLE / TRANSIENT_LOCAL / KEEP_LAST / depth=1")
         self.get_logger().info(f"base_frame                 : {self.base_frame}")
         self.get_logger().info(f"align_offset               : ({self.align_offset_x}, {self.align_offset_y}, {self.align_offset_z})")
+        self.get_logger().info(f"forced_base_z              : {self.forced_base_z:.4f} m")
+        self.get_logger().info(f"TF timestamp mode          : latest TF only by default, use_msg_timestamp={self.use_msg_timestamp}")
         self.get_logger().info(
             f"right_align_quaternion     : ({self.right_align_qx}, {self.right_align_qy}, "
             f"{self.right_align_qz}, {self.right_align_qw})"
@@ -245,7 +258,7 @@ class CaliZedNode(Node):
         )
         self.get_logger().info("ARM RULE: base_link y < 0 -> right, y >= 0 -> left")
         self.get_logger().info(f"SHELF1 ARM OVERRIDE       : force_left_arm_for_shelf1={self.force_left_arm_for_shelf1}")
-        self.get_logger().info("SHELF METADATA: /target_shelf_id from master -> ObjectAlign.shelf_type")
+        self.get_logger().info("SHELF METADATA: master /target_shelf_id -> ObjectAlign.shelf_type")
         if self.db_metadata:
             self.get_logger().info(f"DB metadata                : {self.db_metadata}")
         self.get_logger().info("========================================")
@@ -274,7 +287,7 @@ class CaliZedNode(Node):
         if not os.path.exists(yaml_path):
             self.get_logger().warn(
                 f"item_database.yaml not found: {yaml_path}. "
-                f"CALI_ZED ignores local DB for runtime target fields; master topics are authoritative."
+                f"CALI_ZED can still work with master target topics."
             )
             return {}, {}
 
@@ -340,21 +353,12 @@ class CaliZedNode(Node):
             self.get_logger().info(f"[STOP] {self.start_topic} false. ObjectAlign publish paused.")
 
     def target_item_cb(self, msg: String):
-        """Store item label only.
-
-        IMPORTANT:
-          This node must trust the master target topics as the single source
-          of truth. Therefore /target_item_name is used only as a human-readable
-          label/name and never used to look up local item_database.yaml values.
-
-          Authoritative fields are:
-            /target_aruco_id     -> current_aruco_id
-            /target_text_prompt  -> current_text_prompt
-            /target_shelf_id     -> current_shelf_type
-
-        This prevents robot PC / operator PC YAML mismatches from overwriting
-        shelf_type or text_prompt after the master already published them.
-        """
+        # /target_item_name is the receiver-side label string from master.
+        # Do NOT look up local YAML here. The receiving PC may not have item_database.yaml.
+        # This string is copied directly to ObjectAlign.label without format/name changes.
+        # Example with the user's YAML:
+        #   input 'snack' or alias '말차과자' -> master publishes /target_item_name = '과자'
+        #   this node publishes ObjectAlign.label = '과자'
         item_name = msg.data.strip()
         self.current_item_name = item_name
         self.current_item = {
@@ -365,12 +369,12 @@ class CaliZedNode(Node):
 
         self.get_logger().info(
             "\n"
-            "[TARGET ITEM UPDATED - MASTER TOPIC ONLY]\n"
-            f"input        : {item_name}\n"
-            "source       : /target_item_name only; local item DB ignored\n"
-            f"aruco_id     : {self.current_aruco_id}\n"
-            f"text_prompt  : {self.current_text_prompt}\n"
-            f"shelf_type   : {self.current_shelf_type}"
+            "[TARGET ITEM UPDATED - PRODUCT LABEL MASTER TOPIC ONLY]\n"
+            f"ObjectAlign.label : {item_name}\n"
+            "source            : /target_item_name copied as-is; local item DB ignored\n"
+            f"aruco_id          : {self.current_aruco_id}\n"
+            f"text_prompt       : {self.current_text_prompt}\n"
+            f"shelf_type        : {self.current_shelf_type}"
         )
 
     def target_aruco_id_cb(self, msg: Int32):
@@ -458,16 +462,18 @@ class CaliZedNode(Node):
         try:
             T_base_from_src = self.make_transform_matrix(tf_msg)
             p_base = T_base_from_src @ p_src
+            # Force final base_link Z. Keep transformed X/Y only.
+            p_base[2] = self.forced_base_z
         except Exception as e:
             self.get_logger().error(f"[{source_name}] Transform application failed: {repr(e)}")
             return None
 
         out_msg = PointStamped()
-        out_msg.header.stamp = msg.header.stamp
+        out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = self.base_frame
         out_msg.point.x = float(p_base[0])
         out_msg.point.y = float(p_base[1])
-        out_msg.point.z = float(p_base[2])
+        out_msg.point.z = float(self.forced_base_z)
         publisher.publish(out_msg)
 
         self.get_logger().info(
@@ -498,7 +504,7 @@ class CaliZedNode(Node):
         label = self.resolve_label()
 
         out = ObjectAlign()
-        out.header.stamp = original_msg.header.stamp
+        out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id = self.base_frame
 
         out.aruco_id = int(self.current_aruco_id)
@@ -512,7 +518,7 @@ class CaliZedNode(Node):
 
         out.marker_position.x = float(p_base[0])
         out.marker_position.y = float(p_base[1])
-        out.marker_position.z = float(p_base[2])
+        out.marker_position.z = float(self.forced_base_z)
 
         out.align_pose = self.make_align_pose(p_base, selected_arm)
 
@@ -540,15 +546,10 @@ class CaliZedNode(Node):
         )
 
     def resolve_label(self) -> str:
-        if self.current_item is not None:
-            if "item_id" in self.current_item:
-                return str(self.current_item["item_id"])
-            if "item_key" in self.current_item:
-                return str(self.current_item["item_key"])
-
+        # ObjectAlign.label must be exactly the string received on /target_item_name.
+        # No item_id/product_name/alias remapping is performed here.
         if self.current_item_name:
-            return self.current_item_name
-
+            return str(self.current_item_name)
         return "unknown"
 
     def make_align_pose(self, p_base: np.ndarray, selected_arm: str) -> Pose:
@@ -556,7 +557,9 @@ class CaliZedNode(Node):
 
         pose.position.x = float(p_base[0]) + self.align_offset_x
         pose.position.y = float(p_base[1]) + self.align_offset_y
-        pose.position.z = float(p_base[2]) + self.align_offset_z
+        # Z is forced to a fixed base_link height regardless of ArUco measurement.
+        # align_offset_z is intentionally ignored to keep ObjectAlign Z exactly fixed.
+        pose.position.z = float(self.forced_base_z)
 
         arm = (selected_arm or "").strip().lower()
         if arm == "left":
